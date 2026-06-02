@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Label Merger — M4 Mart</title>
+<style>
+  :root {
+    --bg: #f5f4f0;
+    --card: #ffffff;
+    --border: #e2e0d8;
+    --text: #1a1916;
+    --muted: #7a7870;
+    --accent: #1a1916;
+    --accent-fg: #ffffff;
+    --green: #166534;
+    --green-bg: #dcfce7;
+    --red: #991b1b;
+    --red-bg: #fee2e2;
+    --amber: #92400e;
+    --amber-bg: #fef3c7;
+    --blue: #1e40af;
+    --blue-bg: #dbeafe;
+    --radius: 10px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  header { background: var(--accent); color: var(--accent-fg); padding: 0 2rem; height: 56px; display: flex; align-items: center; justify-content: space-between; }
+  header .brand { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  header .sub { font-size: 12px; opacity: 0.5; margin-top: 1px; }
+  header .tag { font-size: 11px; background: rgba(255,255,255,0.12); padding: 3px 10px; border-radius: 20px; }
+  main { max-width: 760px; margin: 0 auto; padding: 2.5rem 1.5rem; }
+  h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.03em; margin-bottom: 6px; }
+  .subtitle { font-size: 14px; color: var(--muted); margin-bottom: 2rem; line-height: 1.6; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 1.5rem; margin-bottom: 1.25rem; }
+  .card-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 1rem; }
+  #drop-zone { border: 2px dashed var(--border); border-radius: var(--radius); padding: 3rem 1.5rem; text-align: center; cursor: pointer; transition: all 0.15s; background: var(--bg); }
+  #drop-zone:hover, #drop-zone.over { border-color: var(--accent); background: #f0efea; }
+  .drop-icon { width: 48px; height: 48px; background: var(--accent); border-radius: 12px; display: flex; align-items: center; justify-content: center; margin: 0 auto 1rem; }
+  .drop-icon svg { width: 24px; height: 24px; stroke: white; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .drop-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .drop-sub { font-size: 13px; color: var(--muted); }
+  .drop-hint { font-size: 11px; color: var(--muted); margin-top: 8px; opacity: 0.7; }
+  #file-list { margin-top: 1rem; display: flex; flex-direction: column; gap: 5px; }
+  .file-chip { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: var(--blue-bg); border-radius: 7px; font-size: 12px; color: var(--blue); }
+  .file-chip span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-chip button { border: none; background: none; cursor: pointer; color: var(--blue); font-size: 14px; padding: 0 2px; line-height: 1; opacity: 0.6; }
+  .file-chip button:hover { opacity: 1; }
+  #process-btn { width: 100%; padding: 13px; background: var(--accent); color: white; border: none; border-radius: var(--radius); font-size: 14px; font-weight: 600; cursor: pointer; margin-top: 1rem; transition: opacity 0.15s; display: none; align-items: center; justify-content: center; gap: 8px; }
+  #process-btn:hover { opacity: 0.88; }
+  #process-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  #progress-section { display: none; }
+  .progress-bar-wrap { height: 6px; background: var(--border); border-radius: 99px; overflow: hidden; margin-bottom: 10px; }
+  #progress-bar { height: 100%; background: var(--accent); border-radius: 99px; width: 0%; transition: width 0.3s ease; }
+  #progress-msg { font-size: 13px; color: var(--muted); }
+  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 1.25rem; }
+  .stat { background: var(--bg); border-radius: 8px; padding: 12px 14px; text-align: center; }
+  .stat-num { font-size: 24px; font-weight: 700; letter-spacing: -0.03em; }
+  .stat-lbl { font-size: 11px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat.ok .stat-num { color: var(--green); }
+  .stat.err .stat-num { color: var(--red); }
+  #results-list { display: flex; flex-direction: column; gap: 6px; }
+  .result-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; background: var(--card); flex-wrap: wrap; }
+  .result-row .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-weight: 500; min-width: 100px; }
+  .result-row .skus { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 20px; white-space: nowrap; flex-shrink: 0; }
+  .badge.ok { background: var(--green-bg); color: var(--green); }
+  .badge.err { background: var(--red-bg); color: var(--red); }
+  #download-btn { width: 100%; padding: 14px; background: var(--green); color: white; border: none; border-radius: var(--radius); font-size: 15px; font-weight: 700; cursor: pointer; display: none; align-items: center; justify-content: center; gap: 10px; margin-top: 1rem; transition: opacity 0.15s; }
+  #download-btn:hover { opacity: 0.88; }
+  #reset-btn { width: 100%; padding: 10px; background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: var(--radius); font-size: 13px; cursor: pointer; margin-top: 8px; display: none; transition: background 0.1s; }
+  #reset-btn:hover { background: var(--bg); color: var(--text); }
+  .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .step { padding: 14px; background: var(--bg); border-radius: 8px; }
+  .step-num { font-size: 11px; font-weight: 700; color: var(--muted); margin-bottom: 6px; letter-spacing: 0.05em; }
+  .step-title { font-size: 13px; font-weight: 600; margin-bottom: 3px; }
+  .step-desc { font-size: 12px; color: var(--muted); line-height: 1.5; }
+  @media (max-width: 500px) { .steps { grid-template-columns: 1fr; } h1 { font-size: 22px; } }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="brand">Label Merger</div>
+    <div class="sub">M4 Mart — Pillow Factory</div>
+  </div>
+  <div class="tag">Evri · Amazon</div>
+</header>
+<main>
+  <h1>Shipping Label + Pick List</h1>
+  <p class="subtitle">Upload a ZIP of order PDFs, or select multiple PDFs directly. SKU & quantity from each packing slip gets stamped onto the Evri label. One PDF out — print and go.</p>
+
+  <div class="card">
+    <div class="card-title">Upload</div>
+    <div id="drop-zone"
+      onclick="document.getElementById('file-input').click()"
+      ondragover="ev(event); this.classList.add('over')"
+      ondragleave="this.classList.remove('over')"
+      ondrop="drop(event)">
+      <div class="drop-icon">
+        <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      </div>
+      <div class="drop-title">Drop files here or click to browse</div>
+      <div class="drop-sub">ZIP file <strong>or</strong> multiple PDFs — all accepted</div>
+      <div class="drop-hint">Hold Ctrl to select multiple PDFs at once</div>
+      <input type="file" id="file-input" accept=".zip,.pdf" multiple style="display:none" onchange="filesSelected(this.files)">
+    </div>
+    <div id="file-list"></div>
+    <button id="process-btn" onclick="startProcessing()">
+      Process &amp; merge labels
+    </button>
+  </div>
+
+  <div class="card" id="progress-section">
+    <div class="card-title">Progress</div>
+    <div class="progress-bar-wrap"><div id="progress-bar"></div></div>
+    <div id="progress-msg">Starting...</div>
+  </div>
+
+  <div class="card" id="results-section" style="display:none;">
+    <div class="stats-grid">
+      <div class="stat"><div class="stat-num" id="stat-total">0</div><div class="stat-lbl">Total</div></div>
+      <div class="stat ok"><div class="stat-num" id="stat-ok">0</div><div class="stat-lbl">Merged</div></div>
+      <div class="stat err"><div class="stat-num" id="stat-err">0</div><div class="stat-lbl">Errors</div></div>
+    </div>
+    <div id="results-list"></div>
+    <button id="download-btn" onclick="downloadResult()"></button>
+    <button id="reset-btn" onclick="resetApp()">Start again</button>
+  </div>
+
+  <div class="card">
+    <div class="card-title">How it works</div>
+    <div class="steps">
+      <div class="step"><div class="step-num">STEP 01</div><div class="step-title">Upload</div><div class="step-desc">Drop a ZIP, or select multiple PDFs directly — any number of orders.</div></div>
+      <div class="step"><div class="step-num">STEP 02</div><div class="step-title">OCR + extract</div><div class="step-desc">Each packing slip is scanned to pull SKU codes and quantities — Business and Prime formats both supported.</div></div>
+      <div class="step"><div class="step-num">STEP 03</div><div class="step-title">Download</div><div class="step-desc">One PDF with all Evri labels, each stamped with its pick list and order number.</div></div>
+    </div>
+  </div>
+</main>
+
+<script>
+let selectedFiles = [];
+let currentJobId = null;
+let pollInterval = null;
+
+function ev(e) { e.preventDefault(); }
+function drop(e) {
+  e.preventDefault();
+  document.getElementById('drop-zone').classList.remove('over');
+  filesSelected(e.dataTransfer.files);
+}
+
+function filesSelected(fileList) {
+  for (let f of fileList) {
+    if ((f.name.endsWith('.pdf') || f.name.endsWith('.zip')) && !selectedFiles.find(x => x.name === f.name)) {
+      selectedFiles.push(f);
+    }
+  }
+  renderFileList();
+}
+
+function removeFile(i) {
+  selectedFiles.splice(i, 1);
+  renderFileList();
+}
+
+function renderFileList() {
+  const list = document.getElementById('file-list');
+  const btn = document.getElementById('process-btn');
+  if (!selectedFiles.length) { list.innerHTML = ''; btn.style.display = 'none'; return; }
+  btn.style.display = 'flex';
+  list.innerHTML = selectedFiles.map((f, i) =>
+    `<div class="file-chip">
+      <span>📄 ${f.name} <span style="opacity:0.6">(${(f.size/1024).toFixed(0)} KB)</span></span>
+      <button onclick="removeFile(${i})" title="Remove">✕</button>
+    </div>`
+  ).join('');
+}
+
+async function startProcessing() {
+  if (!selectedFiles.length) return;
+  const btn = document.getElementById('process-btn');
+  btn.disabled = true;
+  btn.textContent = 'Uploading...';
+  document.getElementById('progress-section').style.display = 'block';
+  document.getElementById('results-section').style.display = 'none';
+
+  const form = new FormData();
+  // If single ZIP, send as-is. If PDFs, send all.
+  for (let f of selectedFiles) form.append('files', f);
+
+  try {
+    const res = await fetch('/upload', { method: 'POST', body: form });
+    const data = await res.json();
+    if (data.error) { alert(data.error); btn.disabled = false; return; }
+    currentJobId = data.job_id;
+    btn.textContent = 'Processing...';
+    pollInterval = setInterval(pollStatus, 1200);
+  } catch(e) {
+    alert('Upload failed: ' + e.message);
+    btn.disabled = false;
+  }
+}
+
+async function pollStatus() {
+  if (!currentJobId) return;
+  try {
+    const res = await fetch('/status/' + currentJobId);
+    const data = await res.json();
+    document.getElementById('progress-bar').style.width = data.progress + '%';
+    document.getElementById('progress-msg').textContent = data.message;
+    if (data.status === 'done') { clearInterval(pollInterval); showResults(data); }
+  } catch(e) {}
+}
+
+function showResults(data) {
+  const results = data.results || [];
+  const ok = results.filter(r => r.status === 'ok').length;
+  const err = results.filter(r => r.status === 'error').length;
+  document.getElementById('stat-total').textContent = results.length;
+  document.getElementById('stat-ok').textContent = ok;
+  document.getElementById('stat-err').textContent = err;
+  document.getElementById('results-list').innerHTML = results.map(r => {
+    const skuText = r.items ? r.items.map(i => i.qty + '× ' + i.sku).join(' | ') : (r.error || '');
+    const badge = r.status === 'ok'
+      ? `<span class="badge ok">✓ ${r.items ? r.items.length : 0} SKU${r.items && r.items.length !== 1 ? 's' : ''}</span>`
+      : `<span class="badge err">Error</span>`;
+    return `<div class="result-row">${badge}<span class="fname">${r.file}</span><span class="skus">${skuText}</span></div>`;
+  }).join('');
+  document.getElementById('results-section').style.display = 'block';
+  if (ok > 0) {
+    const dl = document.getElementById('download-btn');
+    dl.style.display = 'flex';
+    dl.textContent = `⬇ Download merged_labels.pdf (${ok} label${ok !== 1 ? 's' : ''})`;
+  }
+  document.getElementById('reset-btn').style.display = 'block';
+  document.getElementById('process-btn').style.display = 'none';
+}
+
+function downloadResult() {
+  if (currentJobId) window.location.href = '/download/' + currentJobId;
+}
+
+function resetApp() {
+  selectedFiles = [];
+  currentJobId = null;
+  clearInterval(pollInterval);
+  renderFileList();
+  document.getElementById('progress-section').style.display = 'none';
+  document.getElementById('results-section').style.display = 'none';
+  document.getElementById('progress-bar').style.width = '0%';
+  document.getElementById('process-btn').disabled = false;
+  document.getElementById('file-input').value = '';
+}
+</script>
+</body>
+</html>
