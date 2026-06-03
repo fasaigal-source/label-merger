@@ -167,19 +167,18 @@ def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w
     min_y = page_h * 0.72
     available_h = start_y - min_y
     n = len(items)
-    line_h = min(15, available_h / n) if n > 0 else 17
-    font_size = min(11, line_h * 0.80)
-    font_size = max(font_size, 6)
+    line_h = min(13, available_h / n) if n > 0 else 13
+    font_size = 9
     max_w = page_w * 0.44
 
     for i, item in enumerate(items):
         y = start_y - (i * line_h)
         text = str(item['qty']) + 'x  ' + item['sku']
         fs = font_size
-        c.setFont('Helvetica-Bold', fs)
-        while c.stringWidth(text, 'Helvetica-Bold', fs) > max_w and fs > 5:
+        c.setFont('Helvetica', fs)
+        while c.stringWidth(text, 'Helvetica', fs) > max_w and fs > 5:
             fs -= 0.5
-        c.setFont('Helvetica-Bold', fs)
+        c.setFont('Helvetica', fs)
         c.drawString(8, y, text)
 
     if order_id:
@@ -199,13 +198,15 @@ def create_royal_mail_overlay(items, order_id, page_num, total_pages, batch_id, 
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
     c.setFillColorRGB(0, 0, 0)
 
-    safe_top = page_h * 0.58
-    safe_bot = page_h * 0.46
+    # Bottom empty strip — sits between address block and "Post by end of" section
+    # On a 4x6 Royal Mail label this strip is roughly 18-28% from bottom
+    safe_top = page_h * 0.26
+    safe_bot = page_h * 0.16
     available_h = safe_top - safe_bot
 
     n = max(len(items), 1)
-    line_h = min(16, available_h / n)
-    font_size = min(12, line_h * 0.78)
+    line_h = min(14, available_h / n)
+    font_size = min(10, line_h * 0.78)
     font_size = max(font_size, 6)
 
     start_y = safe_top - 3
