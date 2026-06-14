@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, re, io, zipfile, tempfile, threading, uuid, string
+import os, re, io, json, zipfile, tempfile, threading, uuid, string
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, render_template
 from pdf2image import convert_from_path
@@ -12,8 +12,66 @@ app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 jobs = {}
 jobs_lock = threading.Lock()
 COUNTER_FILE = os.path.join(os.path.dirname(__file__), 'batch_counter.txt')
+SKU_WEIGHTS_FILE = os.path.join(os.path.dirname(__file__), 'sku_weights.json')
 counter_lock = threading.Lock()
+sku_weights_lock = threading.Lock()
 
+
+# ── SKU WEIGHT MEMORY ────────────────────────────────────────────────────────
+
+def load_sku_weights():
+    try:
+        with open(SKU_WEIGHTS_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_sku_weights(data):
+    try:
+        with open(SKU_WEIGHTS_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except:
+        pass
+
+def update_sku_weight(sku, weight_kg):
+    """Update weight memory for a SKU using most-common weight logic."""
+    if not sku or not weight_kg:
+        return
+    with sku_weights_lock:
+        data = load_sku_weights()
+        if sku not in data:
+            data[sku] = {'weights': [weight_kg], 'typical': weight_kg, 'count': 1}
+        else:
+            data[sku]['weights'].append(weight_kg)
+            data[sku]['count'] += 1
+            # Keep last 20 observations only
+            weights = data[sku]['weights'][-20:]
+            data[sku]['weights'] = weights
+            # Typical = most common weight
+            from collections import Counter
+            data[sku]['typical'] = Counter(weights).most_common(1)[0][0]
+        save_sku_weights(data)
+
+def check_weight_anomaly(sku, weight_kg):
+    """Returns warning string if weight differs significantly from typical, else None."""
+    if not sku or not weight_kg:
+        return None
+    with sku_weights_lock:
+        data = load_sku_weights()
+    if sku not in data or data[sku]['count'] < 3:
+        return None  # Not enough history yet
+    typical = data[sku]['typical']
+    if typical <= 0:
+        return None
+    ratio = weight_kg / typical
+    # Flag if weight is 1.7x or more than typical (suggests higher qty)
+    if ratio >= 1.7:
+        expected_qty = round(ratio)
+        return f'WEIGHT {weight_kg}kg vs typical {typical}kg — expected qty ~{expected_qty}?'
+    return None
+
+
+# ── BATCH ID ─────────────────────────────────────────────────────────────────
 
 def get_next_batch_id():
     with counter_lock:
@@ -36,14 +94,28 @@ def get_next_batch_id():
         return batch_id
 
 
+# ── LABEL DETECTION ──────────────────────────────────────────────────────────
+
 def is_royal_mail_label(page_image):
-    """Detect Royal Mail label from label page image"""
     text = pytesseract.image_to_string(page_image)
     return bool(re.search(r'Royal\s*Mail|Delivered\s+by|Post\s+by\s+the\s+end', text, re.IGNORECASE))
 
 
+def extract_weight_from_label(page_image):
+    """Extract weight in KG from Evri label (Weight in KG field)."""
+    text = pytesseract.image_to_string(page_image)
+    m = re.search(r'Weight\s+in\s+KG[^\d]*([\d.]+)', text, re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1))
+        except:
+            pass
+    return None
+
+
+# ── QTY EXTRACTION ───────────────────────────────────────────────────────────
+
 def extract_skus_on_page(page):
-    """Count SKUs on a page (for pages without a qty column)"""
     text = pytesseract.image_to_string(page)
     table_match = re.search(
         r'(Quantity.*?Product\s+Details|Item\s+description.*?Qty|Shipment\s+details)',
@@ -58,25 +130,23 @@ def extract_skus_on_page(page):
 
 
 def find_qty_from_column(page):
-    """Extract quantities from packing slip page using multiple methods.
-    Returns list of qty strings, or None if not found."""
+    """Extract quantities using multiple methods. Returns (list_of_qtys, confident: bool)."""
     text = pytesseract.image_to_string(page)
 
-    # METHOD 1: Direct text pattern after Quantity header row
-    # Catches "Quantity}" OCR misread by using partial match
+    # METHOD 1: Find partial "Quant" header then number in next row
     table_match = re.search(r'Quant[^\n]*\n([^\n]+)', text, re.IGNORECASE)
     if table_match:
         table_text = text[table_match.start():]
         rows = re.findall(r'\n\s*([1-9][0-9]?)\s+[A-Za-z£].*?£[\d.]+', table_text)
         if rows:
-            return rows
+            return rows, True
 
-    # METHOD 2: Number before product text and £ price anywhere in page
+    # METHOD 2: Number before product text and £ price
     matches = re.findall(r'(?:^|\n)\s*([1-9][0-9]?)\s+[A-Z£].*?£[\d]+\.[\d]+', text, re.MULTILINE)
     if matches:
-        return matches
+        return matches, True
 
-    # METHOD 3: Column position detection with fuzzy header matching
+    # METHOD 3: Column position detection with fuzzy header
     try:
         data = pytesseract.image_to_data(page, output_type=pytesseract.Output.DICT)
         qty_header_x = None
@@ -95,7 +165,6 @@ def find_qty_from_column(page):
             col_x_min = max(0, qty_header_x - 20)
             col_x_max = qty_header_x + 100
             col_qtys = []
-
             for i, word in enumerate(data['text']):
                 w = word.strip()
                 if not w:
@@ -104,22 +173,25 @@ def find_qty_from_column(page):
                         col_x_min <= data['left'][i] <= col_x_max and
                         re.match(r'^[1-9][0-9]{0,2}$', w)):
                     col_qtys.append({'qty': w, 'y': data['top'][i]})
-
             col_qtys.sort(key=lambda x: x['y'])
             if col_qtys:
-                return [q['qty'] for q in col_qtys]
+                return [q['qty'] for q in col_qtys], True
     except:
         pass
 
-    return None
+    # Nothing found — defaulting to 1, mark as NOT confident
+    return None, False
 
+
+# ── PDF EXTRACTION ────────────────────────────────────────────────────────────
 
 def extract_items_from_pdf(pdf_path):
     pages = convert_from_path(str(pdf_path), dpi=300)
     if len(pages) < 2:
-        return [], '', False
+        return [], '', False, None, False
 
     rm_label = is_royal_mail_label(pages[0])
+    label_weight = extract_weight_from_label(pages[0])
 
     full_text = ''
     for p in pages[1:]:
@@ -130,13 +202,18 @@ def extract_items_from_pdf(pdf_path):
     order_id = order_match.group(1) if order_match else ''
 
     all_qtys = []
+    qty_confident = True  # innocent until proven guilty
+
     for p in pages[1:]:
-        result = find_qty_from_column(p)
+        result, confident = find_qty_from_column(p)
         if result is None:
             n = extract_skus_on_page(p)
             all_qtys.extend(['1'] * n)
+            qty_confident = False  # defaulted — not confident
         else:
             all_qtys.extend(result)
+            if not confident:
+                qty_confident = False
 
     table_start = re.search(
         r'(Quantity.*?Product\s+Details|Item\s+description.*?Qty|Shipment\s+details)',
@@ -176,10 +253,12 @@ def extract_items_from_pdf(pdf_path):
 
         items.append({'sku': sku, 'qty': qty})
 
-    return items, order_id, rm_label
+    return items, order_id, rm_label, label_weight, qty_confident
 
 
-def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w, page_h):
+# ── OVERLAY FUNCTIONS ─────────────────────────────────────────────────────────
+
+def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w, page_h, warn=False):
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
     c.setFillColorRGB(0, 0, 0)
@@ -209,18 +288,23 @@ def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w
     c.setFont('Helvetica-Bold', 7)
     c.drawString(8, 8, str(page_num) + '/' + str(total_pages) + batch_id)
 
+    # ⚠ Warning sign if qty not confident
+    if warn:
+        c.setFillColorRGB(1, 0.4, 0)  # Orange
+        c.setFont('Helvetica-Bold', 9)
+        c.drawString(page_w * 0.44, page_h - 28, '⚠ CHECK QTY')
+        c.setFillColorRGB(0, 0, 0)
+
     c.save()
     packet.seek(0)
     return packet
 
 
-def create_royal_mail_overlay(items, order_id, page_num, total_pages, batch_id, page_w, page_h):
+def create_royal_mail_overlay(items, order_id, page_num, total_pages, batch_id, page_w, page_h, warn=False):
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
     c.setFillColorRGB(0, 0, 0)
 
-    # Bottom empty strip — sits between address block and "Post by end of" section
-    # On a 4x6 Royal Mail label this strip is roughly 18-28% from bottom
     safe_top = page_h * 0.26
     safe_bot = page_h * 0.16
     available_h = safe_top - safe_bot
@@ -250,10 +334,19 @@ def create_royal_mail_overlay(items, order_id, page_num, total_pages, batch_id, 
     c.setFillColorRGB(0, 0, 0)
     c.drawString(8, 8, str(page_num) + '/' + str(total_pages) + batch_id)
 
+    # ⚠ Warning sign if qty not confident
+    if warn:
+        c.setFillColorRGB(1, 0.4, 0)  # Orange
+        c.setFont('Helvetica-Bold', 9)
+        c.drawString(8, safe_bot - 14, '⚠ CHECK QTY')
+        c.setFillColorRGB(0, 0, 0)
+
     c.save()
     packet.seek(0)
     return packet
 
+
+# ── JOB RUNNER ───────────────────────────────────────────────────────────────
 
 def run_job(job_id, pdf_files, tmpdir):
     def update(progress, message):
@@ -270,13 +363,27 @@ def run_job(job_id, pdf_files, tmpdir):
         fname = Path(pdf_path).name
         update(int((i / total) * 40), 'Reading ' + str(i+1) + '/' + str(total) + ': ' + fname)
         try:
-            items, order_id, rm_label = extract_items_from_pdf(pdf_path)
+            items, order_id, rm_label, label_weight, qty_confident = extract_items_from_pdf(pdf_path)
             if not items:
                 items = [{'sku': 'NOT FOUND', 'qty': '?'}]
+
+            # Check weight anomaly for each SKU
+            weight_warning = None
+            if label_weight and items:
+                primary_sku = items[0]['sku']
+                weight_warning = check_weight_anomaly(primary_sku, label_weight)
+
+            # Flag if qty not confident OR weight anomaly detected
+            needs_check = not qty_confident or bool(weight_warning)
+
             extracted.append({
                 'path': pdf_path, 'file': fname,
                 'items': items, 'order_id': order_id,
                 'rm_label': rm_label,
+                'label_weight': label_weight,
+                'qty_confident': qty_confident,
+                'weight_warning': weight_warning,
+                'needs_check': needs_check,
                 'sort_key': items[0]['sku'].upper() if items else 'ZZZZ'
             })
         except Exception as e:
@@ -284,6 +391,8 @@ def run_job(job_id, pdf_files, tmpdir):
                 'path': pdf_path, 'file': fname,
                 'items': [{'sku': 'ERROR', 'qty': '?'}],
                 'order_id': '', 'rm_label': False,
+                'label_weight': None, 'qty_confident': False,
+                'weight_warning': None, 'needs_check': False,
                 'sort_key': 'ZZZZ', 'error': str(e)
             })
 
@@ -304,26 +413,44 @@ def run_job(job_id, pdf_files, tmpdir):
             pw = float(label_page.mediabox.width)
             ph = float(label_page.mediabox.height)
 
+            warn = entry.get('needs_check', False)
+
             if entry['rm_label']:
                 overlay_buf = create_royal_mail_overlay(
                     entry['items'], entry['order_id'],
-                    page_num, total_pages, batch_id, pw, ph)
+                    page_num, total_pages, batch_id, pw, ph, warn=warn)
             else:
                 overlay_buf = create_evri_overlay(
                     entry['items'], entry['order_id'],
-                    page_num, total_pages, batch_id, pw, ph)
+                    page_num, total_pages, batch_id, pw, ph, warn=warn)
 
             overlay_reader = PdfReader(overlay_buf)
             label_page.merge_page(overlay_reader.pages[0])
             writer.add_page(label_page)
+
+            # Update SKU weight memory after successful processing
+            if entry['label_weight'] and entry['items']:
+                primary_sku = entry['items'][0]['sku']
+                if primary_sku not in ('NOT FOUND', 'ERROR'):
+                    update_sku_weight(primary_sku, entry['label_weight'])
+
+            warn_reason = []
+            if not entry['qty_confident']:
+                warn_reason.append('qty unconfirmed')
+            if entry['weight_warning']:
+                warn_reason.append(entry['weight_warning'])
+
             results.append({
                 'file': entry['file'], 'status': 'ok',
                 'items': entry['items'], 'order_id': entry['order_id'],
                 'page': page_num, 'batch': batch_id,
-                'carrier': 'Royal Mail' if entry['rm_label'] else 'Evri'
+                'carrier': 'Royal Mail' if entry['rm_label'] else 'Evri',
+                'needs_check': warn,
+                'warn_reason': ' | '.join(warn_reason) if warn_reason else None
             })
         except Exception as e:
-            results.append({'file': entry['file'], 'status': 'error', 'error': str(e)})
+            results.append({'file': entry['file'], 'status': 'error', 'error': str(e),
+                           'needs_check': False, 'warn_reason': None})
 
     update(95, 'Saving PDF...')
     out_path = os.path.join(tmpdir, 'labels_batch' + batch_id + '_' + job_id + '.pdf')
@@ -331,15 +458,22 @@ def run_job(job_id, pdf_files, tmpdir):
         writer.write(f)
 
     ok_count = len([r for r in results if r['status'] == 'ok'])
+    warn_count = len([r for r in results if r.get('needs_check')])
+
     with jobs_lock:
         jobs[job_id]['status'] = 'done'
         jobs[job_id]['progress'] = 100
-        jobs[job_id]['message'] = 'Batch ' + batch_id + ' done — ' + str(ok_count) + '/' + str(total_pages) + ' labels merged'
+        msg = 'Batch ' + batch_id + ' done — ' + str(ok_count) + '/' + str(total_pages) + ' labels merged'
+        if warn_count:
+            msg += ' — ⚠ ' + str(warn_count) + ' need checking'
+        jobs[job_id]['message'] = msg
         jobs[job_id]['result_path'] = out_path
         jobs[job_id]['results'] = results
         jobs[job_id]['batch_id'] = batch_id
         jobs[job_id]['download_name'] = 'labels_batch' + batch_id + '.pdf'
 
+
+# ── ROUTES ────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
