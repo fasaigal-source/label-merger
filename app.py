@@ -58,39 +58,60 @@ def extract_skus_on_page(page):
 
 
 def find_qty_from_column(page):
-    """Find Quantity/Qty column header, read numbers below it.
-    Returns list of qty strings, or None if no qty column."""
-    data = pytesseract.image_to_data(page, output_type=pytesseract.Output.DICT)
-    qty_header_x = None
-    qty_header_y = None
-    qty_header_h = 20
+    """Extract quantities from packing slip page using multiple methods.
+    Returns list of qty strings, or None if not found."""
+    text = pytesseract.image_to_string(page)
 
-    for i, word in enumerate(data['text']):
-        w = word.strip()
-        if w.lower() in ('quantity', 'qty'):
-            qty_header_x = data['left'][i]
-            qty_header_y = data['top'][i]
-            qty_header_h = data['height'][i]
-            break
+    # METHOD 1: Direct text pattern after Quantity header row
+    # Catches "Quantity}" OCR misread by using partial match
+    table_match = re.search(r'Quant[^\n]*\n([^\n]+)', text, re.IGNORECASE)
+    if table_match:
+        table_text = text[table_match.start():]
+        rows = re.findall(r'\n\s*([1-9][0-9]?)\s+[A-Za-z£].*?£[\d.]+', table_text)
+        if rows:
+            return rows
 
-    if qty_header_x is None:
-        return None
+    # METHOD 2: Number before product text and £ price anywhere in page
+    matches = re.findall(r'(?:^|\n)\s*([1-9][0-9]?)\s+[A-Z£].*?£[\d]+\.[\d]+', text, re.MULTILINE)
+    if matches:
+        return matches
 
-    col_x_min = max(0, qty_header_x - 20)
-    col_x_max = qty_header_x + 100
-    qtys = []
+    # METHOD 3: Column position detection with fuzzy header matching
+    try:
+        data = pytesseract.image_to_data(page, output_type=pytesseract.Output.DICT)
+        qty_header_x = None
+        qty_header_y = None
+        qty_header_h = 20
 
-    for i, word in enumerate(data['text']):
-        w = word.strip()
-        if not w:
-            continue
-        if (data['top'][i] > qty_header_y + qty_header_h and
-                col_x_min <= data['left'][i] <= col_x_max and
-                re.match(r'^[1-9][0-9]{0,2}$', w)):
-            qtys.append({'qty': w, 'y': data['top'][i]})
+        for i, word in enumerate(data['text']):
+            w = word.strip().lower()
+            if re.match(r'quant', w) or w in ('qty', 'qty}', 'qty|'):
+                qty_header_x = data['left'][i]
+                qty_header_y = data['top'][i]
+                qty_header_h = data['height'][i]
+                break
 
-    qtys.sort(key=lambda x: x['y'])
-    return [q['qty'] for q in qtys] if qtys else None
+        if qty_header_x is not None:
+            col_x_min = max(0, qty_header_x - 20)
+            col_x_max = qty_header_x + 100
+            col_qtys = []
+
+            for i, word in enumerate(data['text']):
+                w = word.strip()
+                if not w:
+                    continue
+                if (data['top'][i] > qty_header_y + qty_header_h and
+                        col_x_min <= data['left'][i] <= col_x_max and
+                        re.match(r'^[1-9][0-9]{0,2}$', w)):
+                    col_qtys.append({'qty': w, 'y': data['top'][i]})
+
+            col_qtys.sort(key=lambda x: x['y'])
+            if col_qtys:
+                return [q['qty'] for q in col_qtys]
+    except:
+        pass
+
+    return None
 
 
 def extract_items_from_pdf(pdf_path):
