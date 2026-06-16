@@ -54,7 +54,7 @@
   .progress-bar-wrap { height: 6px; background: var(--border); border-radius: 99px; overflow: hidden; margin-bottom: 10px; }
   #progress-bar { height: 100%; background: var(--accent); border-radius: 99px; width: 0%; transition: width 0.3s ease; }
   #progress-msg { font-size: 13px; color: var(--muted); }
-  .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 1.25rem; }
+  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 1.25rem; }
   .stat { background: var(--bg); border-radius: 8px; padding: 12px 14px; text-align: center; }
   .stat-num { font-size: 24px; font-weight: 700; letter-spacing: -0.03em; }
   .stat-lbl { font-size: 11px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -80,7 +80,14 @@
   .badge.warn { background: #fef3c7; color: #92400e; }
   .warn-reason { font-size: 10px; color: #92400e; width: 100%; margin-top: 3px; }
   .stat.warn .stat-num { color: var(--amber); }
-  @media (max-width: 500px) { .steps { grid-template-columns: 1fr; } h1 { font-size: 22px; } }
+  .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 1.25rem; }
+  .override-section { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 1rem; }
+  .override-toggle { font-size: 12px; color: var(--muted); cursor: pointer; background: none; border: none; padding: 0; text-decoration: underline; }
+  .override-row { display: flex; gap: 8px; margin-top: 8px; }
+  .override-row input { flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+  .override-row input[type=number] { width: 80px; flex: none; }
+  .override-add { font-size: 12px; color: var(--blue); background: none; border: none; cursor: pointer; padding: 0; margin-top: 6px; }
+  @media (max-width: 500px) { .steps { grid-template-columns: 1fr; } h1 { font-size: 22px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>
 </head>
 <body>
@@ -111,6 +118,16 @@
       <input type="file" id="file-input" accept=".zip,.pdf" multiple style="display:none" onchange="filesSelected(this.files)">
     </div>
     <div id="file-list"></div>
+
+    <div class="override-section">
+      <button class="override-toggle" onclick="toggleOverrides()">⚙ Weight overrides (optional)</button>
+      <div id="override-area" style="display:none">
+        <p style="font-size:11px;color:var(--muted);margin-top:6px">If you know a label weight is wrong, enter the correct weight here before processing.</p>
+        <div id="override-rows"></div>
+        <button class="override-add" onclick="addOverrideRow()">+ Add SKU override</button>
+      </div>
+    </div>
+
     <button id="process-btn" onclick="startProcessing()">
       Process &amp; merge labels
     </button>
@@ -194,6 +211,7 @@ async function startProcessing() {
   const form = new FormData();
   // If single ZIP, send as-is. If PDFs, send all.
   for (let f of selectedFiles) form.append('files', f);
+  form.append('weight_overrides', JSON.stringify(getWeightOverrides()));
 
   try {
     const res = await fetch('/upload', { method: 'POST', body: form });
@@ -227,15 +245,13 @@ function showResults(data) {
   document.getElementById('stat-total').textContent = results.length;
   document.getElementById('stat-ok').textContent = ok;
   document.getElementById('stat-err').textContent = err;
-  const warnStat = document.getElementById('stat-warn');
-  if (warnStat) warnStat.textContent = warn;
+  const ws = document.getElementById('stat-warn');
+  if (ws) ws.textContent = warn;
   document.getElementById('results-list').innerHTML = results.map(r => {
     const skuText = r.items ? r.items.map(i => i.qty + '× ' + i.sku).join(' | ') : (r.error || '');
     const isWarn = r.needs_check;
     const badge = r.status === 'ok'
-      ? (isWarn
-          ? `<span class="badge warn">⚠ CHECK QTY</span>`
-          : `<span class="badge ok">✓ ${r.items ? r.items.length : 0} SKU${r.items && r.items.length !== 1 ? 's' : ''}</span>`)
+      ? (isWarn ? `<span class="badge warn">⚠ CHECK QTY</span>` : `<span class="badge ok">✓ ${r.items ? r.items.length : 0} SKU${r.items && r.items.length !== 1 ? 's' : ''}</span>`)
       : `<span class="badge err">Error</span>`;
     const warnRow = isWarn && r.warn_reason ? `<span class="warn-reason">⚠ ${r.warn_reason}</span>` : '';
     return `<div class="result-row${isWarn ? ' warn' : ''}">${badge}<span class="fname">${r.file}</span><span class="skus">${skuText}</span>${warnRow}</div>`;
@@ -252,6 +268,34 @@ function showResults(data) {
 
 function downloadResult() {
   if (currentJobId) window.location.href = '/download/' + currentJobId;
+}
+
+
+function toggleOverrides() {
+  const area = document.getElementById('override-area');
+  area.style.display = area.style.display === 'none' ? 'block' : 'none';
+  if (area.style.display === 'block' && document.getElementById('override-rows').children.length === 0) {
+    addOverrideRow();
+  }
+}
+
+function addOverrideRow() {
+  const row = document.createElement('div');
+  row.className = 'override-row';
+  row.innerHTML = `<input type="text" placeholder="SKU (e.g. BD-6372=P4)"><input type="number" step="0.01" min="0.1" max="30" placeholder="kg">
+    <button onclick="this.parentElement.remove()" style="padding:4px 8px;background:var(--red-bg);color:var(--red);border:none;border-radius:4px;cursor:pointer">✕</button>`;
+  document.getElementById('override-rows').appendChild(row);
+}
+
+function getWeightOverrides() {
+  const overrides = {};
+  document.querySelectorAll('#override-rows .override-row').forEach(row => {
+    const inputs = row.querySelectorAll('input');
+    const sku = inputs[0].value.trim();
+    const weight = inputs[1].value.trim();
+    if (sku && weight) overrides[sku] = weight;
+  });
+  return overrides;
 }
 
 function resetApp() {
