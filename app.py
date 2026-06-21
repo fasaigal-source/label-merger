@@ -51,6 +51,28 @@ def init_db():
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
         ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS sku_aliases (
+                id SERIAL PRIMARY KEY,
+                normalized_key TEXT NOT NULL,
+                raw_sku TEXT NOT NULL,
+                canonical_sku TEXT NOT NULL,
+                date_added TIMESTAMP NOT NULL DEFAULT NOW(),
+                last_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+                times_seen INTEGER NOT NULL DEFAULT 1,
+                UNIQUE (normalized_key, canonical_sku)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS sku_unmapped (
+                normalized_key TEXT PRIMARY KEY,
+                raw_sku TEXT NOT NULL,
+                first_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+                last_seen TIMESTAMP NOT NULL DEFAULT NOW(),
+                times_seen INTEGER NOT NULL DEFAULT 1,
+                dismissed BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        ''')
         conn.commit()
         cur.close()
         conn.close()
@@ -203,6 +225,203 @@ def delete_sku_weight(sku):
         return True
     except Exception as e:
         print(f"Delete SKU weight error: {e}")
+        return False
+
+
+# ── SKU ALIAS / CANONICAL MAPPING ────────────────────────────────────────────
+# Many Amazon listings are duplicates of the same physical product, distinguished
+# only by symbols added to the SKU to satisfy Amazon's "no duplicate SKU" rule
+# (e.g. HF-P2Px3~ , HF-P2Px3* , HF-P2Px3!! are all the same item as HF-P2Px3).
+# '+' and '-' are NOT noise — they carry real meaning (e.g. v-plo+cse = "with case",
+# 6372-P2 vs 6372-P4 = different quantities) so they're preserved, with repeated
+# runs (++, +++, --, ---) collapsed to a single occurrence so messy OCR variants
+# of the *same* meaningful symbol still match each other.
+# Matching is exact-only against a confirmed table — nothing is ever auto-merged
+# without the user explicitly approving the mapping in /admin.
+
+def normalize_sku_key(sku):
+    """Build the lookup key used for alias matching.
+    Strips all symbols except + and -, then collapses runs of + or - into one."""
+    if not sku:
+        return ''
+    key = re.sub(r'[^A-Za-z0-9+\-]', '', sku).upper()
+    key = re.sub(r'\+{2,}', '+', key)
+    key = re.sub(r'-{2,}', '-', key)
+    return key
+
+def get_canonical_sku(raw_sku):
+    """Look up raw_sku against confirmed aliases. Returns (canonical_sku, was_mapped).
+    If no confirmed mapping exists, logs it to sku_unmapped and returns the raw SKU unchanged."""
+    if not raw_sku or raw_sku in ('NOT FOUND', 'ERROR'):
+        return raw_sku, False
+    key = normalize_sku_key(raw_sku)
+    if not key:
+        return raw_sku, False
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT canonical_sku FROM sku_aliases WHERE normalized_key = %s LIMIT 1', (key,))
+        row = cur.fetchone()
+        if row:
+            cur.execute('''
+                UPDATE sku_aliases SET last_seen = NOW(), times_seen = times_seen + 1
+                WHERE normalized_key = %s AND canonical_sku = %s
+            ''', (key, row['canonical_sku']))
+            conn.commit()
+            cur.close()
+            conn.close()
+            return row['canonical_sku'], True
+        # No confirmed mapping — log/refresh it in the unmapped queue
+        cur.execute('''
+            INSERT INTO sku_unmapped (normalized_key, raw_sku, first_seen, last_seen, times_seen, dismissed)
+            VALUES (%s, %s, NOW(), NOW(), 1, FALSE)
+            ON CONFLICT (normalized_key) DO UPDATE
+            SET last_seen = NOW(), times_seen = sku_unmapped.times_seen + 1,
+                raw_sku = EXCLUDED.raw_sku
+        ''', (key, raw_sku))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return raw_sku, False
+    except Exception as e:
+        print(f"SKU alias lookup error: {e}")
+        return raw_sku, False
+
+def get_unmapped_skus():
+    """Get all unmapped SKUs seen (excluding dismissed) for admin page."""
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('''
+            SELECT * FROM sku_unmapped WHERE dismissed = FALSE
+            ORDER BY last_seen DESC
+        ''')
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"Get unmapped SKUs error: {e}")
+        return []
+
+def get_all_aliases():
+    """Get all confirmed alias mappings, grouped by canonical SKU, for admin page."""
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('''
+            SELECT * FROM sku_aliases ORDER BY canonical_sku, date_added DESC
+        ''')
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        grouped = {}
+        for r in rows:
+            grouped.setdefault(r['canonical_sku'], []).append(r)
+        return grouped
+    except Exception as e:
+        print(f"Get aliases error: {e}")
+        return {}
+
+def merge_weight_history(from_sku, to_sku):
+    """Fold from_sku's weight history into to_sku's (Option A: retroactive merge)."""
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT * FROM sku_weights WHERE sku = %s', (from_sku,))
+        old = cur.fetchone()
+        if not old:
+            cur.close()
+            conn.close()
+            return
+        cur.execute('SELECT * FROM sku_weights WHERE sku = %s', (to_sku,))
+        target = cur.fetchone()
+        combined = (target['weights'] if target else []) + old['weights']
+        combined = combined[-20:]
+        from collections import Counter
+        typical = Counter([round(w, 1) for w in combined]).most_common(1)[0][0]
+        if target:
+            cur.execute('''
+                UPDATE sku_weights SET weights = %s, typical_weight = %s, count = %s, updated_at = NOW()
+                WHERE sku = %s
+            ''', (json.dumps(combined), typical, len(combined), to_sku))
+        else:
+            cur.execute('''
+                INSERT INTO sku_weights (sku, typical_weight, weights, count, updated_at)
+                VALUES (%s, %s, %s, %s, NOW())
+            ''', (to_sku, typical, json.dumps(combined), len(combined)))
+        cur.execute('DELETE FROM sku_weights WHERE sku = %s', (from_sku,))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Weight history merge error: {e}")
+
+def confirm_sku_alias(raw_sku, canonical_sku):
+    """Add a confirmed mapping, remove it from the unmapped queue, and merge weight history."""
+    key = normalize_sku_key(raw_sku)
+    if not key or not canonical_sku:
+        return False
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO sku_aliases (normalized_key, raw_sku, canonical_sku, date_added, last_seen, times_seen)
+            VALUES (%s, %s, %s, NOW(), NOW(), 1)
+            ON CONFLICT (normalized_key, canonical_sku) DO UPDATE
+            SET raw_sku = EXCLUDED.raw_sku, last_seen = NOW()
+        ''', (key, raw_sku, canonical_sku))
+        cur.execute('DELETE FROM sku_unmapped WHERE normalized_key = %s', (key,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        if raw_sku != canonical_sku:
+            merge_weight_history(raw_sku, canonical_sku)
+        return True
+    except Exception as e:
+        print(f"Confirm alias error: {e}")
+        return False
+
+def dismiss_unmapped_sku(normalized_key):
+    """Mark an unmapped SKU as dismissed (it's its own item, stop asking)."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('UPDATE sku_unmapped SET dismissed = TRUE WHERE normalized_key = %s', (normalized_key,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Dismiss unmapped SKU error: {e}")
+        return False
+
+def delete_sku_alias(alias_id):
+    """Delete a single confirmed alias variant (does not affect canonical SKU's other variants)."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM sku_aliases WHERE id = %s', (alias_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Delete alias error: {e}")
+        return False
+
+def update_sku_alias_canonical(alias_id, new_canonical):
+    """Re-point a confirmed alias to a different canonical SKU (fixes a wrong mapping)."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('UPDATE sku_aliases SET canonical_sku = %s WHERE id = %s', (new_canonical, alias_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Update alias canonical error: {e}")
         return False
 
 
@@ -380,7 +599,11 @@ def extract_items_from_pdf(pdf_path, weight_overrides=None):
         if weight_overrides and sku in weight_overrides:
             label_weight = weight_overrides[sku]
 
-        items.append({'sku': sku, 'qty': qty})
+        canonical_sku, was_mapped = get_canonical_sku(sku)
+        item = {'sku': canonical_sku, 'qty': qty}
+        if was_mapped:
+            item['raw_sku'] = sku
+        items.append(item)
 
     return items, order_id, rm_label, label_weight, qty_confident
 
@@ -728,8 +951,43 @@ def admin():
           </td>
         </tr>'''
 
+    unmapped = get_unmapped_skus()
+    unmapped_html = ''
+    all_canonicals_for_options = sorted(get_all_aliases().keys())
+    options_html = ''.join(f'<option value="{c}">{c}</option>' for c in all_canonicals_for_options)
+    for u in unmapped:
+        unmapped_html += f'''
+        <div class="unmapped-row" id="unmapped-{u['normalized_key']}" data-search="{u['raw_sku'].lower()}">
+          <span class="raw-sku">{u['raw_sku']}</span>
+          <span class="seen-count">seen {u['times_seen']}×</span>
+          <select id="map-select-{u['normalized_key']}">
+            <option value="">Map to existing...</option>
+            {options_html}
+          </select>
+          <button onclick="mapUnmapped('{u['normalized_key']}', '{u['raw_sku']}')" style="padding:4px 10px;background:#166534;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">Map</button>
+          <button onclick="newCanonical('{u['normalized_key']}', '{u['raw_sku']}')" style="padding:4px 10px;background:#1a1916;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">New SKU</button>
+          <button onclick="dismissUnmapped('{u['normalized_key']}')" style="padding:4px 8px;background:#888;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">✕</button>
+        </div>'''
+
+    grouped = get_all_aliases()
+    groups_html = ''
+    for canonical, variants in grouped.items():
+        variant_rows = ''
+        for v in variants:
+            variant_rows += f'''
+            <div class="variant-row" data-search="{v['raw_sku'].lower()} {canonical.lower()}">
+              <span class="raw-sku">{v['raw_sku']}</span>
+              <span class="seen-count">seen {v['times_seen']}×, last {str(v['last_seen'])[:10]}</span>
+              <button onclick="deleteAlias({v['id']}, '{v['raw_sku']}')" style="padding:4px 8px;background:#991b1b;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">Delete</button>
+            </div>'''
+        groups_html += f'''
+        <details class="alias-group" data-search="{canonical.lower()} {' '.join(v['raw_sku'].lower() for v in variants)}">
+          <summary><span class="canonical-name">{canonical}</span><span class="variant-count">{len(variants)} variant{'s' if len(variants) != 1 else ''}</span></summary>
+          <div class="variant-list">{variant_rows}</div>
+        </details>'''
+
     return f'''<!DOCTYPE html>
-    <html><head><title>Admin — SKU Weights</title>
+    <html><head><title>Admin</title>
     <style>
       body {{ font-family: sans-serif; background: #f5f4f0; margin: 0; padding: 2rem; }}
       h1 {{ font-size: 1.4rem; margin-bottom: 0.5rem; }}
@@ -742,17 +1000,60 @@ def admin():
       .nav {{ display: flex; gap: 12px; margin-bottom: 1.5rem; align-items: center; }}
       .btn {{ padding: 8px 16px; background: #1a1916; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; text-decoration: none; display: inline-block; }}
       .msg {{ padding: 10px 14px; background: #dcfce7; color: #166534; border-radius: 6px; margin-bottom: 1rem; display: none; font-size: 13px; }}
+      .tabs {{ display: flex; gap: 4px; margin-bottom: 1.5rem; border-bottom: 2px solid #e5e3da; }}
+      .tab {{ padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600; color: #888; border-bottom: 2px solid transparent; margin-bottom: -2px; }}
+      .tab.active {{ color: #1a1916; border-bottom-color: #1a1916; }}
+      .panel {{ display: none; }}
+      .panel.active {{ display: block; }}
+      .search-box {{ width: 100%; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; box-sizing: border-box; margin-bottom: 1.2rem; }}
+      .section-label {{ font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #888; margin: 0 0 8px; }}
+      .unmapped-row, .variant-row {{ display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #fef3c7; border-radius: 6px; margin-bottom: 6px; font-size: 13px; }}
+      .variant-row {{ background: #fafaf8; border: 1px solid #f0efe8; margin-bottom: 4px; }}
+      .raw-sku {{ font-weight: 600; flex: 1; }}
+      .seen-count {{ font-size: 11px; color: #888; white-space: nowrap; }}
+      select {{ font-size: 12px; padding: 4px 6px; border-radius: 4px; border: 1px solid #ddd; max-width: 160px; }}
+      .alias-group {{ background: white; border: 1px solid #f0efe8; border-radius: 8px; margin-bottom: 6px; overflow: hidden; }}
+      .alias-group summary {{ display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; background: #fafaf8; list-style: none; font-size: 13px; }}
+      .alias-group summary::-webkit-details-marker {{ display: none; }}
+      .canonical-name {{ font-weight: 700; flex: 1; }}
+      .variant-count {{ font-size: 11px; color: #888; }}
+      .variant-list {{ padding: 8px 14px 10px; }}
+      .empty-note {{ color: #888; font-size: 13px; }}
     </style></head>
     <body>
       <div class="nav">
-        <h1>⚙️ SKU Weight Memory</h1>
+        <h1>⚙️ Admin</h1>
         <a href="/" class="btn">← Back to App</a>
         <a href="/admin/logout" class="btn" style="background:#666">Logout</a>
       </div>
-      <p class="sub">Weights auto-expire after 4 weeks. Edit typical weight or delete a SKU to reset its memory.</p>
       <div id="msg" class="msg"></div>
-      {"<p style='color:#888;font-size:13px'>No SKU weight data yet — process some batches first.</p>" if not rows else ""}
-      {"<table><thead><tr><th>SKU</th><th>Typical Weight (kg)</th><th>Seen</th><th>Recent weights</th><th>Last updated</th><th>Action</th></tr></thead><tbody>" + rows_html + "</tbody></table>" if rows else ""}
+
+      <div class="tabs">
+        <div class="tab active" onclick="switchTab('weights')">SKU Weight Memory</div>
+        <div class="tab" onclick="switchTab('aliases')">SKU Aliases</div>
+      </div>
+
+      <div id="panel-weights" class="panel active">
+        <p class="sub">Weights auto-expire after 4 weeks. Edit typical weight or delete a SKU to reset its memory.</p>
+        {"<p class='empty-note'>No SKU weight data yet — process some batches first.</p>" if not rows else ""}
+        {"<table><thead><tr><th>SKU</th><th>Typical Weight (kg)</th><th>Seen</th><th>Recent weights</th><th>Last updated</th><th>Action</th></tr></thead><tbody>" + rows_html + "</tbody></table>" if rows else ""}
+      </div>
+
+      <div id="panel-aliases" class="panel">
+        <p class="sub">Duplicate Amazon listings (e.g. HF-P2Px3~, HF-P2Px3*) can be mapped to one canonical SKU. Nothing merges automatically — confirm each mapping below.</p>
+        <input type="text" class="search-box" id="alias-search" placeholder="Search SKU or canonical name..." oninput="filterAliases()">
+
+        <p class="section-label">Unmapped SKUs seen ({len(unmapped)})</p>
+        <div id="unmapped-list">
+          {unmapped_html if unmapped else "<p class='empty-note'>No unmapped SKUs pending — process some batches to see new ones appear here.</p>"}
+        </div>
+
+        <p class="section-label" style="margin-top:1.5rem">Confirmed mappings ({len(grouped)} canonical SKU{'s' if len(grouped) != 1 else ''})</p>
+        <div id="groups-list">
+          {groups_html if grouped else "<p class='empty-note'>No confirmed mappings yet.</p>"}
+        </div>
+      </div>
+
       <script>
         function showMsg(text, ok=true) {{
           const m = document.getElementById('msg');
@@ -761,6 +1062,23 @@ def admin():
           m.style.background = ok ? '#dcfce7' : '#fee2e2';
           m.style.color = ok ? '#166534' : '#991b1b';
           setTimeout(() => m.style.display = 'none', 3000);
+        }}
+        function switchTab(name) {{
+          document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+          document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+          document.querySelector('.tab[onclick*="' + name + '"]').classList.add('active');
+          document.getElementById('panel-' + name).classList.add('active');
+        }}
+        function filterAliases() {{
+          const q = document.getElementById('alias-search').value.toLowerCase().trim();
+          document.querySelectorAll('#unmapped-list .unmapped-row').forEach(el => {{
+            el.style.display = !q || el.dataset.search.includes(q) ? '' : 'none';
+          }});
+          document.querySelectorAll('#groups-list .alias-group').forEach(el => {{
+            const match = !q || el.dataset.search.includes(q);
+            el.style.display = match ? '' : 'none';
+            if (match && q) el.open = true;
+          }});
         }}
         async function saveWeight(sku) {{
           const val = document.getElementById('w-' + sku).value;
@@ -785,6 +1103,54 @@ def admin():
             showMsg('✓ Deleted ' + sku);
           }} else showMsg('✗ Error: ' + data.error, false);
         }}
+        async function mapUnmapped(key, rawSku) {{
+          const sel = document.getElementById('map-select-' + key);
+          const canonical = sel.value;
+          if (!canonical) {{ showMsg('✗ Pick a canonical SKU first', false); return; }}
+          await confirmAlias(key, rawSku, canonical);
+        }}
+        function newCanonical(key, rawSku) {{
+          const canonical = prompt('New canonical SKU for "' + rawSku + '":', rawSku);
+          if (!canonical) return;
+          confirmAlias(key, rawSku, canonical);
+        }}
+        async function confirmAlias(key, rawSku, canonical) {{
+          const res = await fetch('/admin/confirm-alias', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{raw_sku: rawSku, canonical_sku: canonical}})
+          }});
+          const data = await res.json();
+          if (data.ok) {{
+            showMsg('✓ Mapped ' + rawSku + ' → ' + canonical);
+            setTimeout(() => location.reload(), 600);
+          }} else showMsg('✗ Error: ' + data.error, false);
+        }}
+        async function dismissUnmapped(key) {{
+          const res = await fetch('/admin/dismiss-unmapped', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{normalized_key: key}})
+          }});
+          const data = await res.json();
+          if (data.ok) {{
+            document.getElementById('unmapped-' + key).remove();
+            showMsg('✓ Dismissed — won\\'t ask again');
+          }} else showMsg('✗ Error: ' + data.error, false);
+        }}
+        async function deleteAlias(id, rawSku) {{
+          if (!confirm('Remove mapping for ' + rawSku + '? It will print as-is next time and be re-queued as unmapped.')) return;
+          const res = await fetch('/admin/delete-alias', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{id}})
+          }});
+          const data = await res.json();
+          if (data.ok) {{
+            showMsg('✓ Removed mapping for ' + rawSku);
+            setTimeout(() => location.reload(), 600);
+          }} else showMsg('✗ Error: ' + data.error, false);
+        }}
       </script>
     </body></html>'''
 
@@ -807,6 +1173,37 @@ def admin_delete_sku():
     if not sku:
         return jsonify({'ok': False, 'error': 'Missing SKU'})
     ok = delete_sku_weight(sku)
+    return jsonify({'ok': ok})
+
+@app.route('/admin/confirm-alias', methods=['POST'])
+@admin_required
+def admin_confirm_alias():
+    data = request.json
+    raw_sku = data.get('raw_sku')
+    canonical_sku = data.get('canonical_sku')
+    if not raw_sku or not canonical_sku:
+        return jsonify({'ok': False, 'error': 'Missing raw_sku or canonical_sku'})
+    ok = confirm_sku_alias(raw_sku, canonical_sku)
+    return jsonify({'ok': ok})
+
+@app.route('/admin/dismiss-unmapped', methods=['POST'])
+@admin_required
+def admin_dismiss_unmapped():
+    data = request.json
+    normalized_key = data.get('normalized_key')
+    if not normalized_key:
+        return jsonify({'ok': False, 'error': 'Missing normalized_key'})
+    ok = dismiss_unmapped_sku(normalized_key)
+    return jsonify({'ok': ok})
+
+@app.route('/admin/delete-alias', methods=['POST'])
+@admin_required
+def admin_delete_alias():
+    data = request.json
+    alias_id = data.get('id')
+    if not alias_id:
+        return jsonify({'ok': False, 'error': 'Missing id'})
+    ok = delete_sku_alias(alias_id)
     return jsonify({'ok': ok})
 
 
