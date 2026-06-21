@@ -129,7 +129,7 @@
     </div>
 
     <button id="process-btn" onclick="startProcessing()">
-      Process &amp; merge labels
+      ▶ Click to start processing
     </button>
   </div>
 
@@ -204,7 +204,7 @@ async function startProcessing() {
   if (!selectedFiles.length) return;
   const btn = document.getElementById('process-btn');
   btn.disabled = true;
-  btn.textContent = 'Uploading...';
+  btn.textContent = '⏳ Uploading file(s)...';
   document.getElementById('progress-section').style.display = 'block';
   document.getElementById('results-section').style.display = 'none';
 
@@ -216,13 +216,14 @@ async function startProcessing() {
   try {
     const res = await fetch('/upload', { method: 'POST', body: form });
     const data = await res.json();
-    if (data.error) { alert(data.error); btn.disabled = false; return; }
+    if (data.error) { alert(data.error); btn.disabled = false; btn.textContent = '▶ Click to start processing'; return; }
     currentJobId = data.job_id;
-    btn.textContent = 'Processing...';
+    btn.textContent = '⏳ Processing — please wait...';
     pollInterval = setInterval(pollStatus, 1200);
   } catch(e) {
     alert('Upload failed: ' + e.message);
     btn.disabled = false;
+    btn.textContent = '▶ Click to start processing';
   }
 }
 
