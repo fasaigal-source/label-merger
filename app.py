@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, re, io, json, zipfile, tempfile, threading, uuid, string
+import os, re, io, json, zipfile, tempfile, threading, uuid, string, html as html_module
 from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
@@ -423,6 +423,25 @@ def update_sku_alias_canonical(alias_id, new_canonical):
     except Exception as e:
         print(f"Update alias canonical error: {e}")
         return False
+
+
+# ── ADMIN HTML SAFETY HELPERS ────────────────────────────────────────────────
+# SKUs come from OCR and can contain quotes, ampersands, etc. (e.g. 19" x 29" x 6).
+# These must be escaped before being embedded in HTML attributes or onclick="..." JS
+# string literals, or the markup breaks and buttons can misfire / navigate wrongly.
+
+def esc_html(s):
+    """Safe for HTML text content and double-quoted attributes."""
+    return html_module.escape(str(s), quote=True)
+
+def esc_js(s):
+    """Safe for embedding inside a single-quoted JS string literal in onclick=\"...('...')\"."""
+    return (str(s)
+            .replace('\\', '\\\\')
+            .replace("'", "\\'")
+            .replace('"', '&quot;')
+            .replace('\n', '\\n')
+            .replace('<', '\\x3C'))
 
 
 # ── ADMIN AUTH ────────────────────────────────────────────────────────────────
@@ -933,53 +952,62 @@ def admin_logout():
 def admin():
     rows = get_all_sku_weights()
     rows_html = ''
-    for r in rows:
+    for idx, r in enumerate(rows):
         weights_preview = ', '.join([str(w) for w in r['weights'][-5:]])
+        sku_safe = esc_html(r['sku'])
         rows_html += f'''
-        <tr id="row-{r['sku']}">
-          <td style="font-weight:600">{r['sku']}</td>
+        <tr id="row-{idx}" data-sku="{sku_safe}">
+          <td style="font-weight:600">{sku_safe}</td>
           <td>
             <input type="number" step="0.01" value="{r['typical_weight']}" 
-                   id="w-{r['sku']}" style="width:80px;padding:4px;border:1px solid #ddd;border-radius:4px">
-            <button onclick="saveWeight('{r['sku']}')" style="padding:4px 10px;background:#166534;color:white;border:none;border-radius:4px;cursor:pointer;margin-left:4px">Save</button>
+                   id="w-{idx}" style="width:80px;padding:4px;border:1px solid #ddd;border-radius:4px">
+            <button onclick="saveWeight({idx})" style="padding:4px 10px;background:#166534;color:white;border:none;border-radius:4px;cursor:pointer;margin-left:4px">Save</button>
           </td>
           <td>{r['count']}</td>
-          <td style="color:#666;font-size:12px">{weights_preview}</td>
+          <td style="color:#666;font-size:12px">{esc_html(weights_preview)}</td>
           <td>{str(r['updated_at'])[:10]}</td>
           <td>
-            <button onclick="deleteSku('{r['sku']}')" style="padding:4px 10px;background:#991b1b;color:white;border:none;border-radius:4px;cursor:pointer">Delete</button>
+            <button onclick="deleteSku({idx})" style="padding:4px 10px;background:#991b1b;color:white;border:none;border-radius:4px;cursor:pointer">Delete</button>
           </td>
         </tr>'''
 
     unmapped = get_unmapped_skus()
     unmapped_html = ''
     all_canonicals_for_options = sorted(get_all_aliases().keys())
-    datalist_html = ''.join(f'<option value="{c}">' for c in all_canonicals_for_options)
+    datalist_html = ''.join(f'<option value="{esc_html(c)}">' for c in all_canonicals_for_options)
     for u in unmapped:
+        raw_safe = esc_html(u['raw_sku'])
+        search_safe = esc_html(u['raw_sku'].lower())
         unmapped_html += f'''
         <div class="sku-chip" id="unmapped-{u['normalized_key']}" draggable="true"
-             data-key="{u['normalized_key']}" data-raw="{u['raw_sku']}"
-             data-search="{u['raw_sku'].lower()}"
-             ondragstart="onChipDragStart(event)">
-          <span class="raw-sku">{u['raw_sku']}</span>
+             data-key="{u['normalized_key']}" data-raw="{raw_safe}"
+             data-search="{search_safe}"
+             ondragstart="onChipDragStart(event)"
+             onclick="toggleSelect(event, '{u['normalized_key']}', '{raw_safe}')">
+          <span class="raw-sku">{raw_safe}</span>
           <span class="seen-count">{u['times_seen']}×</span>
-          <button class="chip-x" onclick="dismissUnmapped('{u['normalized_key']}')" title="Dismiss — this is its own item" aria-label="Dismiss">✕</button>
+          <button class="chip-x" onclick="dismissUnmapped(event, '{u['normalized_key']}')" title="Dismiss — this is its own item" aria-label="Dismiss">✕</button>
         </div>'''
 
     grouped = get_all_aliases()
     groups_html = ''
     for canonical, variants in grouped.items():
+        canonical_safe = esc_html(canonical)
+        canonical_search = esc_html(canonical.lower())
         variant_rows = ''
         for v in variants:
+            raw_safe = esc_html(v['raw_sku'])
+            search_safe = esc_html(v['raw_sku'].lower()) + ' ' + canonical_search
             variant_rows += f'''
-            <div class="variant-row" data-search="{v['raw_sku'].lower()} {canonical.lower()}">
-              <span class="raw-sku">{v['raw_sku']}</span>
+            <div class="variant-row" data-search="{search_safe}" data-sku="{raw_safe}">
+              <span class="raw-sku">{raw_safe}</span>
               <span class="seen-count">seen {v['times_seen']}×, last {str(v['last_seen'])[:10]}</span>
-              <button onclick="deleteAlias({v['id']}, '{v['raw_sku']}')" style="padding:4px 8px;background:#991b1b;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">Delete</button>
+              <button onclick="deleteAlias({v['id']}, this)" style="padding:4px 8px;background:#991b1b;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">Delete</button>
             </div>'''
+        group_search = canonical_search + ' ' + ' '.join(esc_html(v['raw_sku'].lower()) for v in variants)
         groups_html += f'''
-        <details class="alias-group" data-search="{canonical.lower()} {' '.join(v['raw_sku'].lower() for v in variants)}">
-          <summary><span class="canonical-name">{canonical}</span><span class="variant-count">{len(variants)} variant{'s' if len(variants) != 1 else ''}</span></summary>
+        <details class="alias-group" data-search="{group_search}">
+          <summary><span class="canonical-name">{canonical_safe}</span><span class="variant-count">{len(variants)} variant{'s' if len(variants) != 1 else ''}</span></summary>
           <div class="variant-list">{variant_rows}</div>
         </details>'''
 
@@ -1010,7 +1038,9 @@ def admin():
       .seen-count {{ font-size: 11px; color: #888; white-space: nowrap; }}
       .hint {{ font-size: 12px; color: #999; margin: -4px 0 10px; }}
       .chip-pool {{ display: flex; flex-wrap: wrap; gap: 8px; min-height: 20px; }}
-      .sku-chip {{ display: flex; align-items: center; gap: 6px; padding: 7px 10px; background: #fef3c7; border: 1px solid #f5d889; border-radius: 8px; font-size: 13px; cursor: grab; user-select: none; }}
+      .sku-chip {{ display: flex; align-items: center; gap: 6px; padding: 7px 10px; background: #fef3c7; border: 1px solid #f5d889; border-radius: 8px; font-size: 13px; cursor: pointer; user-select: none; }}
+      .sku-chip.selected {{ background: #dcfce7; border-color: #166534; box-shadow: 0 0 0 1px #166534 inset; }}
+      .sku-chip.selected .seen-count {{ color: #166534; }}
       .sku-chip:active {{ cursor: grabbing; }}
       .sku-chip.dragging {{ opacity: 0.4; }}
       .sku-chip .raw-sku {{ font-weight: 600; }}
@@ -1020,7 +1050,8 @@ def admin():
       .staging-tray {{ border: 2px dashed #ccc8b8; border-radius: 10px; padding: 14px; margin-bottom: 1.2rem; background: #fafaf8; transition: background 0.15s, border-color 0.15s; }}
       .staging-tray.drag-over {{ background: #eef6ee; border-color: #166534; }}
       .tray-label {{ font-size: 12px; color: #999; margin: 0 0 8px; }}
-      .tray-chips {{ display: flex; flex-wrap: wrap; gap: 8px; min-height: 24px; }}
+      .tray-chips {{ display: flex; flex-wrap: wrap; gap: 8px; min-height: 24px; align-items: center; }}
+      .tray-empty {{ font-size: 12px; color: #aaa; font-style: italic; }}
       .tray-chips .sku-chip {{ background: #dcfce7; border-color: #86efac; }}
       .tray-chips .sku-chip .seen-count {{ color: #166534; }}
       .tray-chips .chip-x {{ color: #166534; }}
@@ -1056,13 +1087,13 @@ def admin():
       </div>
 
       <div id="panel-aliases" class="panel">
-        <p class="sub">Duplicate Amazon listings (e.g. HF-P2Px3~, HF-P2Px3*) can be mapped to one canonical SKU. Nothing merges automatically — drag SKUs into the tray below, set the master SKU, then confirm.</p>
+        <p class="sub">Duplicate Amazon listings (e.g. HF-P2Px3~, HF-P2Px3*) can be mapped to one canonical SKU. Nothing merges automatically — click SKUs below to select them, set the master SKU, then confirm.</p>
         <input type="text" class="search-box" id="alias-search" placeholder="Search SKU or canonical name..." oninput="filterAliases()">
         <datalist id="canonical-options">{datalist_html}</datalist>
 
         <div id="staging-tray" class="staging-tray" ondragover="onTrayDragOver(event)" ondrop="onTrayDrop(event)" ondragleave="onTrayDragLeave(event)">
-          <p class="tray-label">Drag SKUs here to group them</p>
-          <div id="tray-chips" class="tray-chips"></div>
+          <p class="tray-label">Selected SKUs (click chips below, or drag them here)</p>
+          <div id="tray-chips" class="tray-chips"><span class="tray-empty">None selected yet</span></div>
           <div id="tray-master-row" class="tray-master-row" style="display:none">
             <span class="tray-master-label">Master SKU:</span>
             <input type="text" id="tray-master-input" list="canonical-options" placeholder="e.g. HF-P2Px3">
@@ -1072,7 +1103,7 @@ def admin():
         </div>
 
         <p class="section-label">Unmapped SKUs seen ({len(unmapped)})</p>
-        <p class="hint">Drag chips into the tray above to group them, or click ✕ to dismiss a SKU as its own item.</p>
+        <p class="hint">Click a SKU to select it (selected = green). Select 2+ that are the same product, set a master SKU above, then confirm. Click ✕ to dismiss a SKU as its own item.</p>
         <div id="unmapped-list" class="chip-pool" ondragover="onTrayDragOver(event)" ondrop="onPoolDrop(event)">
           {unmapped_html if unmapped else "<p class='empty-note'>No unmapped SKUs pending — process some batches to see new ones appear here.</p>"}
         </div>
@@ -1109,8 +1140,9 @@ def admin():
             if (match && q) el.open = true;
           }});
         }}
-        async function saveWeight(sku) {{
-          const val = document.getElementById('w-' + sku).value;
+        async function saveWeight(idx) {{
+          const sku = document.getElementById('row-' + idx).dataset.sku;
+          const val = document.getElementById('w-' + idx).value;
           const res = await fetch('/admin/update-weight', {{
             method: 'POST',
             headers: {{'Content-Type': 'application/json'}},
@@ -1119,7 +1151,9 @@ def admin():
           const data = await res.json();
           showMsg(data.ok ? '✓ Weight updated for ' + sku : '✗ Error: ' + data.error, data.ok);
         }}
-        async function deleteSku(sku) {{
+        async function deleteSku(idx) {{
+          const row = document.getElementById('row-' + idx);
+          const sku = row.dataset.sku;
           if (!confirm('Delete weight history for ' + sku + '?')) return;
           const res = await fetch('/admin/delete-sku', {{
             method: 'POST',
@@ -1128,26 +1162,32 @@ def admin():
           }});
           const data = await res.json();
           if (data.ok) {{
-            document.getElementById('row-' + sku).remove();
+            row.remove();
             showMsg('✓ Deleted ' + sku);
           }} else showMsg('✗ Error: ' + data.error, false);
         }}
-        // ── Drag and drop staging tray ──────────────────────────────────────
+        // ── Selection tray (click-to-select, with drag-and-drop as a secondary option) ──
         let trayItems = {{}}; // key -> rawSku
 
+        function toggleSelect(e, key, raw) {{
+          if (e.target.closest('.chip-x')) return; // dismiss button handles its own click
+          if (trayItems[key]) {{
+            removeFromTray(key);
+          }} else {{
+            addToTray(key, raw);
+          }}
+        }}
         function onChipDragStart(e) {{
-          e.dataTransfer.setData('text/plain', JSON.stringify({{
-            key: e.target.closest('.sku-chip').dataset.key,
-            raw: e.target.closest('.sku-chip').dataset.raw
-          }}));
-          e.target.closest('.sku-chip').classList.add('dragging');
+          const chip = e.target.closest('.sku-chip');
+          e.dataTransfer.setData('text/plain', JSON.stringify({{ key: chip.dataset.key, raw: chip.dataset.raw }}));
+          chip.classList.add('dragging');
         }}
         function onTrayDragOver(e) {{
           e.preventDefault();
           document.getElementById('staging-tray').classList.add('drag-over');
         }}
         function onTrayDragLeave(e) {{
-          if (e.target.id === 'staging-tray') document.getElementById('staging-tray').classList.remove('drag-over');
+          if (e.currentTarget === e.target) document.getElementById('staging-tray').classList.remove('drag-over');
         }}
         function onTrayDrop(e) {{
           e.preventDefault();
@@ -1156,45 +1196,47 @@ def admin():
           addToTray(data.key, data.raw);
         }}
         function onPoolDrop(e) {{
-          // Dropping back on the pool removes a chip from the tray
           e.preventDefault();
-          const data = JSON.parse(e.dataTransfer.getData('text/plain'));
-          if (trayItems[data.key]) {{
-            delete trayItems[data.key];
-            renderTray();
-          }}
+          const data = JSON.parse(e.dataTransfer.getData('text/plain') || '{{}}');
+          if (data.key && trayItems[data.key]) removeFromTray(data.key);
         }}
         function addToTray(key, raw) {{
           trayItems[key] = raw;
           const chip = document.getElementById('unmapped-' + key);
-          if (chip) chip.style.display = 'none';
+          if (chip) chip.classList.add('selected');
           renderTray();
         }}
         function removeFromTray(key) {{
           delete trayItems[key];
           const chip = document.getElementById('unmapped-' + key);
-          if (chip) chip.style.display = '';
+          if (chip) chip.classList.remove('selected');
           renderTray();
+        }}
+        function escapeHtml(s) {{
+          const d = document.createElement('div');
+          d.textContent = s;
+          return d.innerHTML;
         }}
         function renderTray() {{
           const keys = Object.keys(trayItems);
           const trayChips = document.getElementById('tray-chips');
           const masterRow = document.getElementById('tray-master-row');
-          trayChips.innerHTML = keys.map(k => `
-            <div class="sku-chip" draggable="true" data-key="${{k}}" data-raw="${{trayItems[k]}}" ondragstart="onChipDragStart(event)">
-              <span class="raw-sku">${{trayItems[k]}}</span>
-              <button class="chip-x" onclick="removeFromTray('${{k}}')" title="Remove from group" aria-label="Remove">✕</button>
-            </div>`).join('');
+          trayChips.innerHTML = keys.length
+            ? keys.map(k => `
+              <div class="sku-chip selected" draggable="true" data-key="${{k}}" data-raw="${{escapeHtml(trayItems[k])}}" ondragstart="onChipDragStart(event)">
+                <span class="raw-sku">${{escapeHtml(trayItems[k])}}</span>
+                <button class="chip-x" onclick="removeFromTray('${{k}}')" title="Remove from selection" aria-label="Remove">✕</button>
+              </div>`).join('')
+            : '<span class="tray-empty">None selected yet</span>';
           masterRow.style.display = keys.length ? 'flex' : 'none';
           if (keys.length && !document.getElementById('tray-master-input').value) {{
-            // Default suggestion: the most-seen raw SKU text, edit freely
             document.getElementById('tray-master-input').value = trayItems[keys[0]];
           }}
         }}
         function clearTray() {{
           Object.keys(trayItems).forEach(k => {{
             const chip = document.getElementById('unmapped-' + k);
-            if (chip) chip.style.display = '';
+            if (chip) chip.classList.remove('selected');
           }});
           trayItems = {{}};
           document.getElementById('tray-master-input').value = '';
@@ -1204,7 +1246,7 @@ def admin():
           const master = document.getElementById('tray-master-input').value.trim();
           const keys = Object.keys(trayItems);
           if (!master) {{ showMsg('✗ Enter a master SKU first', false); return; }}
-          if (!keys.length) {{ showMsg('✗ Drag at least one SKU into the tray', false); return; }}
+          if (!keys.length) {{ showMsg('✗ Select at least one SKU first', false); return; }}
           let okCount = 0;
           for (const key of keys) {{
             const res = await fetch('/admin/confirm-alias', {{
@@ -1222,7 +1264,8 @@ def admin():
             showMsg('✗ Mapped ' + okCount + '/' + keys.length + ' — check and retry', false);
           }}
         }}
-        async function dismissUnmapped(key) {{
+        async function dismissUnmapped(e, key) {{
+          e.stopPropagation();
           const res = await fetch('/admin/dismiss-unmapped', {{
             method: 'POST',
             headers: {{'Content-Type': 'application/json'}},
@@ -1231,10 +1274,12 @@ def admin():
           const data = await res.json();
           if (data.ok) {{
             document.getElementById('unmapped-' + key).remove();
+            if (trayItems[key]) {{ delete trayItems[key]; renderTray(); }}
             showMsg('✓ Dismissed — won\\'t ask again');
           }} else showMsg('✗ Error: ' + data.error, false);
         }}
-        async function deleteAlias(id, rawSku) {{
+        async function deleteAlias(id, btn) {{
+          const rawSku = btn.closest('.variant-row').dataset.sku;
           if (!confirm('Remove mapping for ' + rawSku + '? It will print as-is next time and be re-queued as unmapped.')) return;
           const res = await fetch('/admin/delete-alias', {{
             method: 'POST',
