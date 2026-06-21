@@ -954,19 +954,16 @@ def admin():
     unmapped = get_unmapped_skus()
     unmapped_html = ''
     all_canonicals_for_options = sorted(get_all_aliases().keys())
-    options_html = ''.join(f'<option value="{c}">{c}</option>' for c in all_canonicals_for_options)
+    datalist_html = ''.join(f'<option value="{c}">' for c in all_canonicals_for_options)
     for u in unmapped:
         unmapped_html += f'''
-        <div class="unmapped-row" id="unmapped-{u['normalized_key']}" data-search="{u['raw_sku'].lower()}">
+        <div class="sku-chip" id="unmapped-{u['normalized_key']}" draggable="true"
+             data-key="{u['normalized_key']}" data-raw="{u['raw_sku']}"
+             data-search="{u['raw_sku'].lower()}"
+             ondragstart="onChipDragStart(event)">
           <span class="raw-sku">{u['raw_sku']}</span>
-          <span class="seen-count">seen {u['times_seen']}×</span>
-          <select id="map-select-{u['normalized_key']}">
-            <option value="">Map to existing...</option>
-            {options_html}
-          </select>
-          <button onclick="mapUnmapped('{u['normalized_key']}', '{u['raw_sku']}')" style="padding:4px 10px;background:#166534;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">Map</button>
-          <button onclick="newCanonical('{u['normalized_key']}', '{u['raw_sku']}')" style="padding:4px 10px;background:#1a1916;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">New SKU</button>
-          <button onclick="dismissUnmapped('{u['normalized_key']}')" style="padding:4px 8px;background:#888;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">✕</button>
+          <span class="seen-count">{u['times_seen']}×</span>
+          <button class="chip-x" onclick="dismissUnmapped('{u['normalized_key']}')" title="Dismiss — this is its own item" aria-label="Dismiss">✕</button>
         </div>'''
 
     grouped = get_all_aliases()
@@ -1011,6 +1008,25 @@ def admin():
       .variant-row {{ background: #fafaf8; border: 1px solid #f0efe8; margin-bottom: 4px; }}
       .raw-sku {{ font-weight: 600; flex: 1; }}
       .seen-count {{ font-size: 11px; color: #888; white-space: nowrap; }}
+      .hint {{ font-size: 12px; color: #999; margin: -4px 0 10px; }}
+      .chip-pool {{ display: flex; flex-wrap: wrap; gap: 8px; min-height: 20px; }}
+      .sku-chip {{ display: flex; align-items: center; gap: 6px; padding: 7px 10px; background: #fef3c7; border: 1px solid #f5d889; border-radius: 8px; font-size: 13px; cursor: grab; user-select: none; }}
+      .sku-chip:active {{ cursor: grabbing; }}
+      .sku-chip.dragging {{ opacity: 0.4; }}
+      .sku-chip .raw-sku {{ font-weight: 600; }}
+      .sku-chip .seen-count {{ font-size: 10px; color: #92400e; background: rgba(255,255,255,0.5); padding: 1px 6px; border-radius: 10px; }}
+      .chip-x {{ border: none; background: none; cursor: pointer; color: #92400e; font-size: 13px; padding: 0 2px; line-height: 1; opacity: 0.6; }}
+      .chip-x:hover {{ opacity: 1; }}
+      .staging-tray {{ border: 2px dashed #ccc8b8; border-radius: 10px; padding: 14px; margin-bottom: 1.2rem; background: #fafaf8; transition: background 0.15s, border-color 0.15s; }}
+      .staging-tray.drag-over {{ background: #eef6ee; border-color: #166534; }}
+      .tray-label {{ font-size: 12px; color: #999; margin: 0 0 8px; }}
+      .tray-chips {{ display: flex; flex-wrap: wrap; gap: 8px; min-height: 24px; }}
+      .tray-chips .sku-chip {{ background: #dcfce7; border-color: #86efac; }}
+      .tray-chips .sku-chip .seen-count {{ color: #166534; }}
+      .tray-chips .chip-x {{ color: #166534; }}
+      .tray-master-row {{ display: flex; align-items: center; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #e5e3da; }}
+      .tray-master-label {{ font-size: 13px; font-weight: 600; color: #555; }}
+      #tray-master-input {{ flex: 1; max-width: 260px; padding: 7px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; }}
       select {{ font-size: 12px; padding: 4px 6px; border-radius: 4px; border: 1px solid #ddd; max-width: 160px; }}
       .alias-group {{ background: white; border: 1px solid #f0efe8; border-radius: 8px; margin-bottom: 6px; overflow: hidden; }}
       .alias-group summary {{ display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; background: #fafaf8; list-style: none; font-size: 13px; }}
@@ -1040,11 +1056,24 @@ def admin():
       </div>
 
       <div id="panel-aliases" class="panel">
-        <p class="sub">Duplicate Amazon listings (e.g. HF-P2Px3~, HF-P2Px3*) can be mapped to one canonical SKU. Nothing merges automatically — confirm each mapping below.</p>
+        <p class="sub">Duplicate Amazon listings (e.g. HF-P2Px3~, HF-P2Px3*) can be mapped to one canonical SKU. Nothing merges automatically — drag SKUs into the tray below, set the master SKU, then confirm.</p>
         <input type="text" class="search-box" id="alias-search" placeholder="Search SKU or canonical name..." oninput="filterAliases()">
+        <datalist id="canonical-options">{datalist_html}</datalist>
+
+        <div id="staging-tray" class="staging-tray" ondragover="onTrayDragOver(event)" ondrop="onTrayDrop(event)" ondragleave="onTrayDragLeave(event)">
+          <p class="tray-label">Drag SKUs here to group them</p>
+          <div id="tray-chips" class="tray-chips"></div>
+          <div id="tray-master-row" class="tray-master-row" style="display:none">
+            <span class="tray-master-label">Master SKU:</span>
+            <input type="text" id="tray-master-input" list="canonical-options" placeholder="e.g. HF-P2Px3">
+            <button onclick="confirmTray()" style="padding:6px 14px;background:#166534;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px">Confirm group</button>
+            <button onclick="clearTray()" style="padding:6px 10px;background:#888;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px">Clear</button>
+          </div>
+        </div>
 
         <p class="section-label">Unmapped SKUs seen ({len(unmapped)})</p>
-        <div id="unmapped-list">
+        <p class="hint">Drag chips into the tray above to group them, or click ✕ to dismiss a SKU as its own item.</p>
+        <div id="unmapped-list" class="chip-pool" ondragover="onTrayDragOver(event)" ondrop="onPoolDrop(event)">
           {unmapped_html if unmapped else "<p class='empty-note'>No unmapped SKUs pending — process some batches to see new ones appear here.</p>"}
         </div>
 
@@ -1071,7 +1100,7 @@ def admin():
         }}
         function filterAliases() {{
           const q = document.getElementById('alias-search').value.toLowerCase().trim();
-          document.querySelectorAll('#unmapped-list .unmapped-row').forEach(el => {{
+          document.querySelectorAll('#unmapped-list .sku-chip').forEach(el => {{
             el.style.display = !q || el.dataset.search.includes(q) ? '' : 'none';
           }});
           document.querySelectorAll('#groups-list .alias-group').forEach(el => {{
@@ -1103,28 +1132,95 @@ def admin():
             showMsg('✓ Deleted ' + sku);
           }} else showMsg('✗ Error: ' + data.error, false);
         }}
-        async function mapUnmapped(key, rawSku) {{
-          const sel = document.getElementById('map-select-' + key);
-          const canonical = sel.value;
-          if (!canonical) {{ showMsg('✗ Pick a canonical SKU first', false); return; }}
-          await confirmAlias(key, rawSku, canonical);
+        // ── Drag and drop staging tray ──────────────────────────────────────
+        let trayItems = {{}}; // key -> rawSku
+
+        function onChipDragStart(e) {{
+          e.dataTransfer.setData('text/plain', JSON.stringify({{
+            key: e.target.closest('.sku-chip').dataset.key,
+            raw: e.target.closest('.sku-chip').dataset.raw
+          }}));
+          e.target.closest('.sku-chip').classList.add('dragging');
         }}
-        function newCanonical(key, rawSku) {{
-          const canonical = prompt('New canonical SKU for "' + rawSku + '":', rawSku);
-          if (!canonical) return;
-          confirmAlias(key, rawSku, canonical);
+        function onTrayDragOver(e) {{
+          e.preventDefault();
+          document.getElementById('staging-tray').classList.add('drag-over');
         }}
-        async function confirmAlias(key, rawSku, canonical) {{
-          const res = await fetch('/admin/confirm-alias', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify({{raw_sku: rawSku, canonical_sku: canonical}})
+        function onTrayDragLeave(e) {{
+          if (e.target.id === 'staging-tray') document.getElementById('staging-tray').classList.remove('drag-over');
+        }}
+        function onTrayDrop(e) {{
+          e.preventDefault();
+          document.getElementById('staging-tray').classList.remove('drag-over');
+          const data = JSON.parse(e.dataTransfer.getData('text/plain'));
+          addToTray(data.key, data.raw);
+        }}
+        function onPoolDrop(e) {{
+          // Dropping back on the pool removes a chip from the tray
+          e.preventDefault();
+          const data = JSON.parse(e.dataTransfer.getData('text/plain'));
+          if (trayItems[data.key]) {{
+            delete trayItems[data.key];
+            renderTray();
+          }}
+        }}
+        function addToTray(key, raw) {{
+          trayItems[key] = raw;
+          const chip = document.getElementById('unmapped-' + key);
+          if (chip) chip.style.display = 'none';
+          renderTray();
+        }}
+        function removeFromTray(key) {{
+          delete trayItems[key];
+          const chip = document.getElementById('unmapped-' + key);
+          if (chip) chip.style.display = '';
+          renderTray();
+        }}
+        function renderTray() {{
+          const keys = Object.keys(trayItems);
+          const trayChips = document.getElementById('tray-chips');
+          const masterRow = document.getElementById('tray-master-row');
+          trayChips.innerHTML = keys.map(k => `
+            <div class="sku-chip" draggable="true" data-key="${{k}}" data-raw="${{trayItems[k]}}" ondragstart="onChipDragStart(event)">
+              <span class="raw-sku">${{trayItems[k]}}</span>
+              <button class="chip-x" onclick="removeFromTray('${{k}}')" title="Remove from group" aria-label="Remove">✕</button>
+            </div>`).join('');
+          masterRow.style.display = keys.length ? 'flex' : 'none';
+          if (keys.length && !document.getElementById('tray-master-input').value) {{
+            // Default suggestion: the most-seen raw SKU text, edit freely
+            document.getElementById('tray-master-input').value = trayItems[keys[0]];
+          }}
+        }}
+        function clearTray() {{
+          Object.keys(trayItems).forEach(k => {{
+            const chip = document.getElementById('unmapped-' + k);
+            if (chip) chip.style.display = '';
           }});
-          const data = await res.json();
-          if (data.ok) {{
-            showMsg('✓ Mapped ' + rawSku + ' → ' + canonical);
+          trayItems = {{}};
+          document.getElementById('tray-master-input').value = '';
+          renderTray();
+        }}
+        async function confirmTray() {{
+          const master = document.getElementById('tray-master-input').value.trim();
+          const keys = Object.keys(trayItems);
+          if (!master) {{ showMsg('✗ Enter a master SKU first', false); return; }}
+          if (!keys.length) {{ showMsg('✗ Drag at least one SKU into the tray', false); return; }}
+          let okCount = 0;
+          for (const key of keys) {{
+            const res = await fetch('/admin/confirm-alias', {{
+              method: 'POST',
+              headers: {{'Content-Type': 'application/json'}},
+              body: JSON.stringify({{raw_sku: trayItems[key], canonical_sku: master}})
+            }});
+            const data = await res.json();
+            if (data.ok) okCount++;
+          }}
+          if (okCount === keys.length) {{
+            showMsg('✓ Mapped ' + okCount + ' SKU' + (okCount !== 1 ? 's' : '') + ' → ' + master);
             setTimeout(() => location.reload(), 600);
-          }} else showMsg('✗ Error: ' + data.error, false);
+          }} else {{
+            showMsg('✗ Mapped ' + okCount + '/' + keys.length + ' — check and retry', false);
+          }}
         }}
         async function dismissUnmapped(key) {{
           const res = await fetch('/admin/dismiss-unmapped', {{
