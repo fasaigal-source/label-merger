@@ -304,6 +304,23 @@ def get_unmapped_skus():
         print(f"Get unmapped SKUs error: {e}")
         return []
 
+def get_alias_variants_for_canonical(canonical_sku):
+    """Get all confirmed variants for one canonical SKU (for AJAX fragment rendering)."""
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('''
+            SELECT * FROM sku_aliases WHERE canonical_sku = %s ORDER BY date_added DESC
+        ''', (canonical_sku,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"Get alias variants error: {e}")
+        return []
+
+
 def get_all_aliases():
     """Get all confirmed alias mappings, grouped by canonical SKU, for admin page."""
     try:
@@ -947,6 +964,33 @@ def admin_logout():
     session.pop('admin_logged_in', None)
     return redirect('/admin/login')
 
+def render_group_html(g_idx, canonical, variants):
+    """Render a single confirmed-alias group's HTML (used both for full page render and AJAX patches)."""
+    canonical_safe = esc_html(canonical)
+    canonical_search = esc_html(canonical.lower())
+    variant_rows = ''
+    for v in variants:
+        raw_safe = esc_html(v['raw_sku'])
+        search_safe = esc_html(v['raw_sku'].lower()) + ' ' + canonical_search
+        variant_rows += f'''
+        <div class="variant-row" id="variant-{v['id']}" data-search="{search_safe}" data-sku="{raw_safe}">
+          <span class="raw-sku">{raw_safe}</span>
+          <span class="seen-count">seen {v['times_seen']}×, last {str(v['last_seen'])[:10]}</span>
+          <button onclick="deleteAlias({v['id']}, this)" style="padding:4px 8px;background:#991b1b;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">Delete</button>
+        </div>'''
+    group_search = canonical_search + ' ' + ' '.join(esc_html(v['raw_sku'].lower()) for v in variants)
+    return f'''
+        <details class="alias-group" id="group-{g_idx}" data-search="{group_search}" data-canonical="{canonical_safe}"
+                  ondragover="onGroupDragOver(event)" ondragleave="onGroupDragLeave(event)" ondrop="onGroupDrop(event, this)">
+          <summary>
+            <span class="canonical-name">{canonical_safe}</span>
+            <span class="variant-count">{len(variants)} variant{'s' if len(variants) != 1 else ''}</span>
+            <button class="add-here-btn" onclick="addSelectedToGroup(event, this)" title="Add currently selected SKUs to this group">+ Add selected</button>
+          </summary>
+          <div class="variant-list" id="variant-list-{g_idx}">{variant_rows}</div>
+        </details>'''
+
+
 @app.route('/admin')
 @admin_required
 def admin():
@@ -991,25 +1035,8 @@ def admin():
 
     grouped = get_all_aliases()
     groups_html = ''
-    for canonical, variants in grouped.items():
-        canonical_safe = esc_html(canonical)
-        canonical_search = esc_html(canonical.lower())
-        variant_rows = ''
-        for v in variants:
-            raw_safe = esc_html(v['raw_sku'])
-            search_safe = esc_html(v['raw_sku'].lower()) + ' ' + canonical_search
-            variant_rows += f'''
-            <div class="variant-row" data-search="{search_safe}" data-sku="{raw_safe}">
-              <span class="raw-sku">{raw_safe}</span>
-              <span class="seen-count">seen {v['times_seen']}×, last {str(v['last_seen'])[:10]}</span>
-              <button onclick="deleteAlias({v['id']}, this)" style="padding:4px 8px;background:#991b1b;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">Delete</button>
-            </div>'''
-        group_search = canonical_search + ' ' + ' '.join(esc_html(v['raw_sku'].lower()) for v in variants)
-        groups_html += f'''
-        <details class="alias-group" data-search="{group_search}">
-          <summary><span class="canonical-name">{canonical_safe}</span><span class="variant-count">{len(variants)} variant{'s' if len(variants) != 1 else ''}</span></summary>
-          <div class="variant-list">{variant_rows}</div>
-        </details>'''
+    for g_idx, (canonical, variants) in enumerate(grouped.items()):
+        groups_html += render_group_html(g_idx, canonical, variants)
 
     return f'''<!DOCTYPE html>
     <html><head><title>Admin</title>
@@ -1062,7 +1089,10 @@ def admin():
       .alias-group {{ background: white; border: 1px solid #f0efe8; border-radius: 8px; margin-bottom: 6px; overflow: hidden; }}
       .alias-group summary {{ display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; background: #fafaf8; list-style: none; font-size: 13px; }}
       .alias-group summary::-webkit-details-marker {{ display: none; }}
+      .alias-group.drag-over {{ outline: 2px solid #166534; outline-offset: -2px; }}
       .canonical-name {{ font-weight: 700; flex: 1; }}
+      .add-here-btn {{ font-size: 11px; padding: 3px 8px; background: #1a1916; color: white; border: none; border-radius: 10px; cursor: pointer; opacity: 0.4; pointer-events: none; }}
+      .add-here-btn.armed {{ opacity: 1; pointer-events: auto; background: #166534; }}
       .variant-count {{ font-size: 11px; color: #888; }}
       .variant-list {{ padding: 8px 14px 10px; }}
       .empty-note {{ color: #888; font-size: 13px; }}
@@ -1128,6 +1158,19 @@ def admin():
           document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
           document.querySelector('.tab[onclick*="' + name + '"]').classList.add('active');
           document.getElementById('panel-' + name).classList.add('active');
+          sessionStorage.setItem('admin-active-tab', name);
+        }}
+        (function restoreTab() {{
+          const saved = sessionStorage.getItem('admin-active-tab');
+          if (saved === 'aliases') switchTab('aliases');
+        }})();
+        (function restoreScroll() {{
+          const y = sessionStorage.getItem('admin-scroll-y');
+          if (y) {{ window.scrollTo(0, parseInt(y)); sessionStorage.removeItem('admin-scroll-y'); }}
+        }})();
+        function saveScrollAndReload() {{
+          sessionStorage.setItem('admin-scroll-y', window.scrollY);
+          location.reload();
         }}
         function filterAliases() {{
           const q = document.getElementById('alias-search').value.toLowerCase().trim();
@@ -1232,6 +1275,7 @@ def admin():
           if (keys.length && !document.getElementById('tray-master-input').value) {{
             document.getElementById('tray-master-input').value = trayItems[keys[0]];
           }}
+          updateArmedButtons();
         }}
         function clearTray() {{
           Object.keys(trayItems).forEach(k => {{
@@ -1247,22 +1291,97 @@ def admin():
           const keys = Object.keys(trayItems);
           if (!master) {{ showMsg('✗ Enter a master SKU first', false); return; }}
           if (!keys.length) {{ showMsg('✗ Select at least one SKU first', false); return; }}
+          await mapKeysToCanonical(keys, master);
+          clearTray();
+        }}
+        async function mapKeysToCanonical(keys, master) {{
           let okCount = 0;
+          let lastFragment = null;
           for (const key of keys) {{
+            const chip = document.getElementById('unmapped-' + key);
+            const raw = trayItems[key] || (chip ? chip.dataset.raw : null);
+            if (!raw) continue;
             const res = await fetch('/admin/confirm-alias', {{
               method: 'POST',
               headers: {{'Content-Type': 'application/json'}},
-              body: JSON.stringify({{raw_sku: trayItems[key], canonical_sku: master}})
+              body: JSON.stringify({{raw_sku: raw, canonical_sku: master}})
             }});
             const data = await res.json();
-            if (data.ok) okCount++;
+            if (data.ok) {{
+              okCount++;
+              lastFragment = data.fragment;
+              if (chip) chip.remove();
+            }}
           }}
-          if (okCount === keys.length) {{
-            showMsg('✓ Mapped ' + okCount + ' SKU' + (okCount !== 1 ? 's' : '') + ' → ' + master);
-            setTimeout(() => location.reload(), 600);
-          }} else {{
+          if (okCount !== keys.length) {{
             showMsg('✗ Mapped ' + okCount + '/' + keys.length + ' — check and retry', false);
+          }} else {{
+            showMsg('✓ Mapped ' + okCount + ' SKU' + (okCount !== 1 ? 's' : '') + ' → ' + master);
           }}
+          if (lastFragment) patchGroupFragment(master, lastFragment);
+          updateUnmappedCount();
+        }}
+        function patchGroupFragment(canonical, fragmentHtml) {{
+          const groupsList = document.getElementById('groups-list');
+          const emptyNote = groupsList.querySelector('.empty-note');
+          if (emptyNote) emptyNote.remove();
+          const existing = Array.from(groupsList.querySelectorAll('.alias-group')).find(
+            g => (g.dataset.canonical || '').toLowerCase() === canonical.toLowerCase());
+          const wasOpen = existing ? existing.open : true;
+          const temp = document.createElement('div');
+          temp.innerHTML = fragmentHtml.trim();
+          const newGroupEl = temp.firstElementChild;
+          newGroupEl.open = wasOpen;
+          if (existing) {{
+            existing.replaceWith(newGroupEl);
+          }} else {{
+            groupsList.appendChild(newGroupEl);
+          }}
+          updateArmedButtons();
+          const headerCount = document.querySelector('p.section-label[style]');
+          const groupCount = groupsList.querySelectorAll('.alias-group').length;
+          const allLabels = document.querySelectorAll('.section-label');
+          if (allLabels[1]) allLabels[1].textContent = 'Confirmed mappings (' + groupCount + ' canonical SKU' + (groupCount !== 1 ? 's' : '') + ')';
+        }}
+        function updateUnmappedCount() {{
+          const remaining = document.querySelectorAll('#unmapped-list .sku-chip').length;
+          const allLabels = document.querySelectorAll('.section-label');
+          if (allLabels[0]) allLabels[0].textContent = 'Unmapped SKUs seen (' + remaining + ')';
+          if (!remaining) {{
+            document.getElementById('unmapped-list').innerHTML =
+              "<p class='empty-note'>No unmapped SKUs pending — process some batches to see new ones appear here.</p>";
+          }}
+        }}
+        function onGroupDragOver(e) {{
+          e.preventDefault();
+          e.currentTarget.classList.add('drag-over');
+        }}
+        function onGroupDragLeave(e) {{
+          if (e.currentTarget === e.target) e.currentTarget.classList.remove('drag-over');
+        }}
+        async function onGroupDrop(e, groupEl) {{
+          e.preventDefault();
+          groupEl.classList.remove('drag-over');
+          const data = JSON.parse(e.dataTransfer.getData('text/plain') || '{{}}');
+          if (!data.key) return;
+          const master = groupEl.dataset.canonical;
+          if (trayItems[data.key]) delete trayItems[data.key];
+          renderTray();
+          await mapKeysToCanonical([data.key], master);
+        }}
+        async function addSelectedToGroup(e, btn) {{
+          e.preventDefault();
+          e.stopPropagation();
+          const keys = Object.keys(trayItems);
+          if (!keys.length) return; // button is inert (not armed) with nothing selected
+          const groupEl = btn.closest('.alias-group');
+          const master = groupEl.dataset.canonical;
+          await mapKeysToCanonical(keys, master);
+          clearTray();
+        }}
+        function updateArmedButtons() {{
+          const armed = Object.keys(trayItems).length > 0;
+          document.querySelectorAll('.add-here-btn').forEach(b => b.classList.toggle('armed', armed));
         }}
         async function dismissUnmapped(e, key) {{
           e.stopPropagation();
@@ -1289,7 +1408,7 @@ def admin():
           const data = await res.json();
           if (data.ok) {{
             showMsg('✓ Removed mapping for ' + rawSku);
-            setTimeout(() => location.reload(), 600);
+            setTimeout(saveScrollAndReload, 500);
           }} else showMsg('✗ Error: ' + data.error, false);
         }}
       </script>
@@ -1325,7 +1444,14 @@ def admin_confirm_alias():
     if not raw_sku or not canonical_sku:
         return jsonify({'ok': False, 'error': 'Missing raw_sku or canonical_sku'})
     ok = confirm_sku_alias(raw_sku, canonical_sku)
-    return jsonify({'ok': ok})
+    if not ok:
+        return jsonify({'ok': False, 'error': 'Could not save mapping'})
+    variants = get_alias_variants_for_canonical(canonical_sku)
+    # Use a stable index based on the current full group list so DOM ids don't collide
+    all_canonicals = sorted(get_all_aliases().keys())
+    g_idx = all_canonicals.index(canonical_sku) if canonical_sku in all_canonicals else len(all_canonicals)
+    fragment = render_group_html(g_idx, canonical_sku, variants)
+    return jsonify({'ok': True, 'canonical_sku': canonical_sku, 'fragment': fragment, 'variant_count': len(variants)})
 
 @app.route('/admin/dismiss-unmapped', methods=['POST'])
 @admin_required
