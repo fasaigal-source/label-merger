@@ -80,6 +80,7 @@
   .badge.warn { background: #fef3c7; color: #92400e; }
   .warn-reason { font-size: 10px; color: #92400e; width: 100%; margin-top: 3px; }
   .stat.warn .stat-num { color: var(--amber); }
+  .mapped-note { font-size: 10px; color: var(--blue); background: var(--blue-bg); padding: 1px 6px; border-radius: 10px; white-space: nowrap; }
   .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 1.25rem; }
   .override-section { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 1rem; }
   .override-toggle { font-size: 12px; color: var(--muted); cursor: pointer; background: none; border: none; padding: 0; text-decoration: underline; }
@@ -250,12 +251,16 @@ function showResults(data) {
   if (ws) ws.textContent = warn;
   document.getElementById('results-list').innerHTML = results.map(r => {
     const skuText = r.items ? r.items.map(i => i.qty + '× ' + i.sku).join(' | ') : (r.error || '');
+    const mappedItems = r.items ? r.items.filter(i => i.raw_sku) : [];
+    const mappedNote = mappedItems.length
+      ? `<span class="mapped-note">mapped from ${mappedItems.map(i => i.raw_sku).join(', ')}</span>`
+      : '';
     const isWarn = r.needs_check;
     const badge = r.status === 'ok'
       ? (isWarn ? `<span class="badge warn">⚠ CHECK QTY</span>` : `<span class="badge ok">✓ ${r.items ? r.items.length : 0} SKU${r.items && r.items.length !== 1 ? 's' : ''}</span>`)
       : `<span class="badge err">Error</span>`;
     const warnRow = isWarn && r.warn_reason ? `<span class="warn-reason">⚠ ${r.warn_reason}</span>` : '';
-    return `<div class="result-row${isWarn ? ' warn' : ''}">${badge}<span class="fname">${r.file}</span><span class="skus">${skuText}</span>${warnRow}</div>`;
+    return `<div class="result-row${isWarn ? ' warn' : ''}">${badge}<span class="fname">${r.file}</span><span class="skus">${skuText}</span>${mappedNote}${warnRow}</div>`;
   }).join('');
   document.getElementById('results-section').style.display = 'block';
   if (ok > 0) {
