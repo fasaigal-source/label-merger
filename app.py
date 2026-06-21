@@ -392,7 +392,7 @@ def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
     c.setFillColorRGB(0, 0, 0)
 
-    start_y = page_h - 28
+    start_y = page_h - 16
     min_y = page_h * 0.72
     available_h = start_y - min_y
     n = len(items)
@@ -422,7 +422,7 @@ def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w
     if warn:
         c.setFillColorRGB(1, 0.4, 0)
         c.setFont('Helvetica-Bold', 9)
-        c.drawString(page_w * 0.62, page_h - 28, '⚠ CHECK QTY')
+        c.drawString(page_w * 0.62, page_h - 16, '⚠ CHECK QTY')
         c.setFillColorRGB(0, 0, 0)
 
     c.save()
