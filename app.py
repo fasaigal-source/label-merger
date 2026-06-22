@@ -965,30 +965,28 @@ def admin_logout():
     return redirect('/admin/login')
 
 def render_group_html(g_idx, canonical, variants):
-    """Render a single confirmed-alias group's HTML (used both for full page render and AJAX patches)."""
+    """Render a single confirmed-alias group's HTML (used both for full page render and AJAX patches).
+    Compact single-row layout: canonical name + inline variant chips (hover reveals delete ×)."""
     canonical_safe = esc_html(canonical)
     canonical_search = esc_html(canonical.lower())
-    variant_rows = ''
+    variant_chips = ''
     for v in variants:
         raw_safe = esc_html(v['raw_sku'])
-        search_safe = esc_html(v['raw_sku'].lower()) + ' ' + canonical_search
-        variant_rows += f'''
-        <div class="variant-row" id="variant-{v['id']}" data-search="{search_safe}" data-sku="{raw_safe}">
-          <span class="raw-sku">{raw_safe}</span>
-          <span class="seen-count">seen {v['times_seen']}×, last {str(v['last_seen'])[:10]}</span>
-          <button onclick="deleteAlias({v['id']}, this)" style="padding:4px 8px;background:#991b1b;color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">Delete</button>
-        </div>'''
+        title_safe = esc_html(f"seen {v['times_seen']}×, last {str(v['last_seen'])[:10]}")
+        variant_chips += f'''
+            <span class="variant-chip" id="variant-{v['id']}" data-sku="{raw_safe}" title="{title_safe}">
+              {raw_safe}
+              <button class="variant-x" onclick="deleteAlias({v['id']}, this)" title="Remove this mapping" aria-label="Remove mapping for {raw_safe}">✕</button>
+            </span>'''
     group_search = canonical_search + ' ' + ' '.join(esc_html(v['raw_sku'].lower()) for v in variants)
     return f'''
-        <details class="alias-group" id="group-{g_idx}" data-search="{group_search}" data-canonical="{canonical_safe}"
-                  ondragover="onGroupDragOver(event)" ondragleave="onGroupDragLeave(event)" ondrop="onGroupDrop(event, this)">
-          <summary>
-            <span class="canonical-name">{canonical_safe}</span>
-            <span class="variant-count">{len(variants)} variant{'s' if len(variants) != 1 else ''}</span>
-            <button class="add-here-btn" onclick="addSelectedToGroup(event, this)" title="Add currently selected SKUs to this group">+ Add selected</button>
-          </summary>
-          <div class="variant-list" id="variant-list-{g_idx}">{variant_rows}</div>
-        </details>'''
+        <div class="alias-group" id="group-{g_idx}" data-search="{group_search}" data-canonical="{canonical_safe}"
+             ondragover="onGroupDragOver(event)" ondragleave="onGroupDragLeave(event)" ondrop="onGroupDrop(event, this)">
+          <span class="canonical-name">{canonical_safe}</span>
+          <span class="variant-chips">{variant_chips}</span>
+          <button class="add-here-btn" onclick="addSelectedToGroup(event, this)" title="Add currently selected SKUs to this group">+ Add selected</button>
+        </div>'''
+
 
 
 @app.route('/admin')
@@ -1059,8 +1057,7 @@ def admin():
       .panel.active {{ display: block; }}
       .search-box {{ width: 100%; padding: 10px 14px; border: 1px solid #ddd; border-radius: 8px; font-size: 13px; box-sizing: border-box; margin-bottom: 1.2rem; }}
       .section-label {{ font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #888; margin: 0 0 8px; }}
-      .unmapped-row, .variant-row {{ display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #fef3c7; border-radius: 6px; margin-bottom: 6px; font-size: 13px; }}
-      .variant-row {{ background: #fafaf8; border: 1px solid #f0efe8; margin-bottom: 4px; }}
+      .unmapped-row {{ display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #fef3c7; border-radius: 6px; margin-bottom: 6px; font-size: 13px; }}
       .raw-sku {{ font-weight: 600; flex: 1; }}
       .seen-count {{ font-size: 11px; color: #888; white-space: nowrap; }}
       .hint {{ font-size: 12px; color: #999; margin: -4px 0 10px; }}
@@ -1086,15 +1083,15 @@ def admin():
       .tray-master-label {{ font-size: 13px; font-weight: 600; color: #555; }}
       #tray-master-input {{ flex: 1; max-width: 260px; padding: 7px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; }}
       select {{ font-size: 12px; padding: 4px 6px; border-radius: 4px; border: 1px solid #ddd; max-width: 160px; }}
-      .alias-group {{ background: white; border: 1px solid #f0efe8; border-radius: 8px; margin-bottom: 6px; overflow: hidden; }}
-      .alias-group summary {{ display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; background: #fafaf8; list-style: none; font-size: 13px; }}
-      .alias-group summary::-webkit-details-marker {{ display: none; }}
+      .alias-group {{ display: flex; align-items: center; flex-wrap: wrap; gap: 8px; background: white; border: 1px solid #f0efe8; border-radius: 8px; margin-bottom: 6px; padding: 8px 12px; font-size: 13px; }}
       .alias-group.drag-over {{ outline: 2px solid #166534; outline-offset: -2px; }}
-      .canonical-name {{ font-weight: 700; flex: 1; }}
-      .add-here-btn {{ font-size: 11px; padding: 3px 8px; background: #1a1916; color: white; border: none; border-radius: 10px; cursor: pointer; opacity: 0.4; pointer-events: none; }}
+      .canonical-name {{ font-weight: 700; white-space: nowrap; }}
+      .variant-chips {{ display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }}
+      .variant-chip {{ position: relative; display: inline-flex; align-items: center; padding: 4px 8px; background: #fafaf8; border: 1px solid #e5e3da; border-radius: 14px; font-size: 12px; color: #555; }}
+      .variant-x {{ border: none; background: none; cursor: pointer; color: #991b1b; font-size: 11px; padding: 0 0 0 5px; line-height: 1; opacity: 0; width: 0; overflow: hidden; transition: opacity 0.1s, width 0.1s; }}
+      .variant-chip:hover .variant-x {{ opacity: 1; width: 12px; }}
+      .add-here-btn {{ font-size: 11px; padding: 3px 8px; background: #1a1916; color: white; border: none; border-radius: 10px; cursor: pointer; opacity: 0.4; pointer-events: none; white-space: nowrap; }}
       .add-here-btn.armed {{ opacity: 1; pointer-events: auto; background: #166534; }}
-      .variant-count {{ font-size: 11px; color: #888; }}
-      .variant-list {{ padding: 8px 14px 10px; }}
       .empty-note {{ color: #888; font-size: 13px; }}
     </style></head>
     <body>
@@ -1178,9 +1175,7 @@ def admin():
             el.style.display = !q || el.dataset.search.includes(q) ? '' : 'none';
           }});
           document.querySelectorAll('#groups-list .alias-group').forEach(el => {{
-            const match = !q || el.dataset.search.includes(q);
-            el.style.display = match ? '' : 'none';
-            if (match && q) el.open = true;
+            el.style.display = (!q || el.dataset.search.includes(q)) ? '' : 'none';
           }});
         }}
         async function saveWeight(idx) {{
@@ -1327,18 +1322,15 @@ def admin():
           if (emptyNote) emptyNote.remove();
           const existing = Array.from(groupsList.querySelectorAll('.alias-group')).find(
             g => (g.dataset.canonical || '').toLowerCase() === canonical.toLowerCase());
-          const wasOpen = existing ? existing.open : true;
           const temp = document.createElement('div');
           temp.innerHTML = fragmentHtml.trim();
           const newGroupEl = temp.firstElementChild;
-          newGroupEl.open = wasOpen;
           if (existing) {{
             existing.replaceWith(newGroupEl);
           }} else {{
             groupsList.appendChild(newGroupEl);
           }}
           updateArmedButtons();
-          const headerCount = document.querySelector('p.section-label[style]');
           const groupCount = groupsList.querySelectorAll('.alias-group').length;
           const allLabels = document.querySelectorAll('.section-label');
           if (allLabels[1]) allLabels[1].textContent = 'Confirmed mappings (' + groupCount + ' canonical SKU' + (groupCount !== 1 ? 's' : '') + ')';
@@ -1398,7 +1390,8 @@ def admin():
           }} else showMsg('✗ Error: ' + data.error, false);
         }}
         async function deleteAlias(id, btn) {{
-          const rawSku = btn.closest('.variant-row').dataset.sku;
+          const chip = btn.closest('.variant-chip');
+          const rawSku = chip.dataset.sku;
           if (!confirm('Remove mapping for ' + rawSku + '? It will print as-is next time and be re-queued as unmapped.')) return;
           const res = await fetch('/admin/delete-alias', {{
             method: 'POST',
@@ -1407,8 +1400,20 @@ def admin():
           }});
           const data = await res.json();
           if (data.ok) {{
+            const group = chip.closest('.alias-group');
+            chip.remove();
+            // If that was the last variant in the group, remove the whole group card
+            if (group && !group.querySelector('.variant-chip')) {{
+              group.remove();
+              const groupsList = document.getElementById('groups-list');
+              if (!groupsList.querySelector('.alias-group')) {{
+                groupsList.innerHTML = "<p class='empty-note'>No confirmed mappings yet.</p>";
+              }}
+              const groupCount = groupsList.querySelectorAll('.alias-group').length;
+              const allLabels = document.querySelectorAll('.section-label');
+              if (allLabels[1]) allLabels[1].textContent = 'Confirmed mappings (' + groupCount + ' canonical SKU' + (groupCount !== 1 ? 's' : '') + ')';
+            }}
             showMsg('✓ Removed mapping for ' + rawSku);
-            setTimeout(saveScrollAndReload, 500);
           }} else showMsg('✗ Error: ' + data.error, false);
         }}
       </script>
