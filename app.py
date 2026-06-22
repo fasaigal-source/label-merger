@@ -374,11 +374,36 @@ def merge_weight_history(from_sku, to_sku):
     except Exception as e:
         print(f"Weight history merge error: {e}")
 
+def find_existing_canonical(canonical_sku):
+    """Case-insensitive lookup: if a canonical SKU already exists that matches except for case,
+    return its exact stored form so we reuse it instead of creating a near-duplicate group."""
+    if not canonical_sku:
+        return None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT DISTINCT canonical_sku FROM sku_aliases
+            WHERE LOWER(canonical_sku) = LOWER(%s) LIMIT 1
+        ''', (canonical_sku,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f"Find existing canonical error: {e}")
+        return None
+
 def confirm_sku_alias(raw_sku, canonical_sku):
     """Add a confirmed mapping, remove it from the unmapped queue, and merge weight history."""
     key = normalize_sku_key(raw_sku)
     if not key or not canonical_sku:
         return False
+    # Reuse an existing canonical SKU's exact casing if one matches case-insensitively,
+    # so typos in casing don't fragment one product into two separate groups.
+    existing = find_existing_canonical(canonical_sku)
+    if existing:
+        canonical_sku = existing
     try:
         conn = get_db()
         cur = conn.cursor()
@@ -966,7 +991,7 @@ def admin_logout():
 
 def render_group_html(g_idx, canonical, variants):
     """Render a single confirmed-alias group's HTML (used both for full page render and AJAX patches).
-    Compact single-row layout: canonical name + inline variant chips (hover reveals delete ×)."""
+    Compact grid-cell card: canonical name + add button on top, variant chips wrap below (hover reveals delete ×)."""
     canonical_safe = esc_html(canonical)
     canonical_search = esc_html(canonical.lower())
     variant_chips = ''
@@ -975,17 +1000,20 @@ def render_group_html(g_idx, canonical, variants):
         title_safe = esc_html(f"seen {v['times_seen']}×, last {str(v['last_seen'])[:10]}")
         variant_chips += f'''
             <span class="variant-chip" id="variant-{v['id']}" data-sku="{raw_safe}" title="{title_safe}">
-              {raw_safe}
+              <span class="raw-sku-text">{raw_safe}</span>
               <button class="variant-x" onclick="deleteAlias({v['id']}, this)" title="Remove this mapping" aria-label="Remove mapping for {raw_safe}">✕</button>
             </span>'''
     group_search = canonical_search + ' ' + ' '.join(esc_html(v['raw_sku'].lower()) for v in variants)
     return f'''
         <div class="alias-group" id="group-{g_idx}" data-search="{group_search}" data-canonical="{canonical_safe}"
              ondragover="onGroupDragOver(event)" ondragleave="onGroupDragLeave(event)" ondrop="onGroupDrop(event, this)">
-          <span class="canonical-name">{canonical_safe}</span>
+          <div class="group-top-row">
+            <span class="canonical-name" title="{canonical_safe}">{canonical_safe}</span>
+            <button class="add-here-btn" onclick="addSelectedToGroup(event, this)" title="Add currently selected SKUs to this group">+ Add</button>
+          </div>
           <span class="variant-chips">{variant_chips}</span>
-          <button class="add-here-btn" onclick="addSelectedToGroup(event, this)" title="Add currently selected SKUs to this group">+ Add selected</button>
         </div>'''
+
 
 
 
@@ -1079,18 +1107,25 @@ def admin():
       .tray-chips .sku-chip {{ background: #dcfce7; border-color: #86efac; }}
       .tray-chips .sku-chip .seen-count {{ color: #166534; }}
       .tray-chips .chip-x {{ color: #166534; }}
-      .tray-master-row {{ display: flex; align-items: center; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #e5e3da; }}
+      .tray-master-row {{ margin-top: 12px; padding-top: 12px; border-top: 1px solid #e5e3da; }}
+      .tray-master-input-wrap {{ display: flex; align-items: center; gap: 8px; }}
       .tray-master-label {{ font-size: 13px; font-weight: 600; color: #555; }}
       #tray-master-input {{ flex: 1; max-width: 260px; padding: 7px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; }}
+      .master-match-hint {{ font-size: 12px; margin: 6px 0 0; padding: 5px 10px; border-radius: 6px; }}
+      .master-match-hint.match {{ background: #dbeafe; color: #1e40af; }}
+      .master-match-hint.nomatch {{ background: #f0efe8; color: #888; }}
       select {{ font-size: 12px; padding: 4px 6px; border-radius: 4px; border: 1px solid #ddd; max-width: 160px; }}
-      .alias-group {{ display: flex; align-items: center; flex-wrap: wrap; gap: 8px; background: white; border: 1px solid #f0efe8; border-radius: 8px; margin-bottom: 6px; padding: 8px 12px; font-size: 13px; }}
+      .groups-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; align-items: start; }}
+      .alias-group {{ display: flex; flex-direction: column; align-items: flex-start; gap: 6px; background: white; border: 1px solid #f0efe8; border-radius: 8px; margin-bottom: 0; padding: 8px 10px; font-size: 13px; min-width: 0; }}
+      .alias-group .group-top-row {{ display: flex; align-items: center; gap: 6px; width: 100%; }}
       .alias-group.drag-over {{ outline: 2px solid #166534; outline-offset: -2px; }}
-      .canonical-name {{ font-weight: 700; white-space: nowrap; }}
-      .variant-chips {{ display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }}
-      .variant-chip {{ position: relative; display: inline-flex; align-items: center; padding: 4px 8px; background: #fafaf8; border: 1px solid #e5e3da; border-radius: 14px; font-size: 12px; color: #555; }}
-      .variant-x {{ border: none; background: none; cursor: pointer; color: #991b1b; font-size: 11px; padding: 0 0 0 5px; line-height: 1; opacity: 0; width: 0; overflow: hidden; transition: opacity 0.1s, width 0.1s; }}
+      .canonical-name {{ font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }}
+      .variant-chips {{ display: flex; flex-wrap: wrap; gap: 4px; width: 100%; }}
+      .variant-chip {{ position: relative; display: inline-flex; align-items: center; max-width: 100%; padding: 4px 8px; background: #fafaf8; border: 1px solid #e5e3da; border-radius: 14px; font-size: 12px; color: #555; overflow: hidden; }}
+      .variant-chip .raw-sku-text {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+      .variant-x {{ border: none; background: none; cursor: pointer; color: #991b1b; font-size: 11px; padding: 0 0 0 5px; line-height: 1; opacity: 0; width: 0; overflow: hidden; transition: opacity 0.1s, width 0.1s; flex-shrink: 0; }}
       .variant-chip:hover .variant-x {{ opacity: 1; width: 12px; }}
-      .add-here-btn {{ font-size: 11px; padding: 3px 8px; background: #1a1916; color: white; border: none; border-radius: 10px; cursor: pointer; opacity: 0.4; pointer-events: none; white-space: nowrap; }}
+      .add-here-btn {{ font-size: 11px; padding: 3px 8px; background: #1a1916; color: white; border: none; border-radius: 10px; cursor: pointer; opacity: 0.4; pointer-events: none; white-space: nowrap; flex-shrink: 0; }}
       .add-here-btn.armed {{ opacity: 1; pointer-events: auto; background: #166534; }}
       .empty-note {{ color: #888; font-size: 13px; }}
     </style></head>
@@ -1117,15 +1152,19 @@ def admin():
         <p class="sub">Duplicate Amazon listings (e.g. HF-P2Px3~, HF-P2Px3*) can be mapped to one canonical SKU. Nothing merges automatically — click SKUs below to select them, set the master SKU, then confirm.</p>
         <input type="text" class="search-box" id="alias-search" placeholder="Search SKU or canonical name..." oninput="filterAliases()">
         <datalist id="canonical-options">{datalist_html}</datalist>
+        <script>window.knownCanonicals = {json.dumps(all_canonicals_for_options)};</script>
 
         <div id="staging-tray" class="staging-tray" ondragover="onTrayDragOver(event)" ondrop="onTrayDrop(event)" ondragleave="onTrayDragLeave(event)">
           <p class="tray-label">Selected SKUs (click chips below, or drag them here)</p>
           <div id="tray-chips" class="tray-chips"><span class="tray-empty">None selected yet</span></div>
           <div id="tray-master-row" class="tray-master-row" style="display:none">
-            <span class="tray-master-label">Master SKU:</span>
-            <input type="text" id="tray-master-input" list="canonical-options" placeholder="e.g. HF-P2Px3">
-            <button onclick="confirmTray()" style="padding:6px 14px;background:#166534;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px">Confirm group</button>
-            <button onclick="clearTray()" style="padding:6px 10px;background:#888;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px">Clear</button>
+            <div class="tray-master-input-wrap">
+              <span class="tray-master-label">Master SKU:</span>
+              <input type="text" id="tray-master-input" list="canonical-options" placeholder="e.g. HF-P2Px3" oninput="checkMasterMatch()">
+              <button onclick="confirmTray()" style="padding:6px 14px;background:#166534;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px">Confirm group</button>
+              <button onclick="clearTray()" style="padding:6px 10px;background:#888;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px">Clear</button>
+            </div>
+            <p id="master-match-hint" class="master-match-hint" style="display:none"></p>
           </div>
         </div>
 
@@ -1136,7 +1175,7 @@ def admin():
         </div>
 
         <p class="section-label" style="margin-top:1.5rem">Confirmed mappings ({len(grouped)} canonical SKU{'s' if len(grouped) != 1 else ''})</p>
-        <div id="groups-list">
+        <div id="groups-list" class="groups-grid">
           {groups_html if grouped else "<p class='empty-note'>No confirmed mappings yet.</p>"}
         </div>
       </div>
@@ -1271,6 +1310,7 @@ def admin():
             document.getElementById('tray-master-input').value = trayItems[keys[0]];
           }}
           updateArmedButtons();
+          checkMasterMatch();
         }}
         function clearTray() {{
           Object.keys(trayItems).forEach(k => {{
@@ -1280,6 +1320,25 @@ def admin():
           trayItems = {{}};
           document.getElementById('tray-master-input').value = '';
           renderTray();
+          checkMasterMatch();
+        }}
+        function checkMasterMatch() {{
+          const val = document.getElementById('tray-master-input').value.trim();
+          const hint = document.getElementById('master-match-hint');
+          if (!val) {{ hint.style.display = 'none'; return; }}
+          const known = window.knownCanonicals || [];
+          const exact = known.find(c => c.toLowerCase() === val.toLowerCase());
+          if (exact) {{
+            hint.textContent = exact === val
+              ? 'Will add to existing group "' + exact + '"'
+              : 'Will merge into existing group "' + exact + '" (matched, ignoring letter case)';
+            hint.className = 'master-match-hint match';
+            hint.style.display = 'block';
+          }} else {{
+            hint.textContent = 'New canonical SKU — no existing group matches "' + val + '"';
+            hint.className = 'master-match-hint nomatch';
+            hint.style.display = 'block';
+          }}
         }}
         async function confirmTray() {{
           const master = document.getElementById('tray-master-input').value.trim();
@@ -1292,6 +1351,8 @@ def admin():
         async function mapKeysToCanonical(keys, master) {{
           let okCount = 0;
           let lastFragment = null;
+          let resolvedCanonical = master;
+          let mergedNotice = false;
           for (const key of keys) {{
             const chip = document.getElementById('unmapped-' + key);
             const raw = trayItems[key] || (chip ? chip.dataset.raw : null);
@@ -1305,15 +1366,19 @@ def admin():
             if (data.ok) {{
               okCount++;
               lastFragment = data.fragment;
+              resolvedCanonical = data.canonical_sku;
+              if (data.merged_into_existing) mergedNotice = true;
               if (chip) chip.remove();
             }}
           }}
           if (okCount !== keys.length) {{
             showMsg('✗ Mapped ' + okCount + '/' + keys.length + ' — check and retry', false);
+          }} else if (mergedNotice) {{
+            showMsg('✓ Mapped ' + okCount + ' SKU' + (okCount !== 1 ? 's' : '') + ' → existing group "' + resolvedCanonical + '" (matched an existing canonical SKU)');
           }} else {{
-            showMsg('✓ Mapped ' + okCount + ' SKU' + (okCount !== 1 ? 's' : '') + ' → ' + master);
+            showMsg('✓ Mapped ' + okCount + ' SKU' + (okCount !== 1 ? 's' : '') + ' → ' + resolvedCanonical);
           }}
-          if (lastFragment) patchGroupFragment(master, lastFragment);
+          if (lastFragment) patchGroupFragment(resolvedCanonical, lastFragment);
           updateUnmappedCount();
         }}
         function patchGroupFragment(canonical, fragmentHtml) {{
@@ -1329,6 +1394,13 @@ def admin():
             existing.replaceWith(newGroupEl);
           }} else {{
             groupsList.appendChild(newGroupEl);
+          }}
+          if (!(window.knownCanonicals || []).some(c => c.toLowerCase() === canonical.toLowerCase())) {{
+            window.knownCanonicals = (window.knownCanonicals || []).concat(canonical);
+            const dl = document.getElementById('canonical-options');
+            const opt = document.createElement('option');
+            opt.value = canonical;
+            dl.appendChild(opt);
           }}
           updateArmedButtons();
           const groupCount = groupsList.querySelectorAll('.alias-group').length;
@@ -1448,15 +1520,20 @@ def admin_confirm_alias():
     canonical_sku = data.get('canonical_sku')
     if not raw_sku or not canonical_sku:
         return jsonify({'ok': False, 'error': 'Missing raw_sku or canonical_sku'})
+    existing = find_existing_canonical(canonical_sku)
+    resolved_canonical = existing or canonical_sku
     ok = confirm_sku_alias(raw_sku, canonical_sku)
     if not ok:
         return jsonify({'ok': False, 'error': 'Could not save mapping'})
-    variants = get_alias_variants_for_canonical(canonical_sku)
-    # Use a stable index based on the current full group list so DOM ids don't collide
+    variants = get_alias_variants_for_canonical(resolved_canonical)
     all_canonicals = sorted(get_all_aliases().keys())
-    g_idx = all_canonicals.index(canonical_sku) if canonical_sku in all_canonicals else len(all_canonicals)
-    fragment = render_group_html(g_idx, canonical_sku, variants)
-    return jsonify({'ok': True, 'canonical_sku': canonical_sku, 'fragment': fragment, 'variant_count': len(variants)})
+    g_idx = all_canonicals.index(resolved_canonical) if resolved_canonical in all_canonicals else len(all_canonicals)
+    fragment = render_group_html(g_idx, resolved_canonical, variants)
+    merged_into_existing = bool(existing) and existing != canonical_sku
+    return jsonify({
+        'ok': True, 'canonical_sku': resolved_canonical, 'fragment': fragment,
+        'variant_count': len(variants), 'merged_into_existing': merged_into_existing
+    })
 
 @app.route('/admin/dismiss-unmapped', methods=['POST'])
 @admin_required
