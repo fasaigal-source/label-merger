@@ -82,12 +82,6 @@
   .stat.warn .stat-num { color: var(--amber); }
   .mapped-note { font-size: 10px; color: var(--blue); background: var(--blue-bg); padding: 1px 6px; border-radius: 10px; white-space: nowrap; }
   .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 1.25rem; }
-  .override-section { margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 1rem; }
-  .override-toggle { font-size: 12px; color: var(--muted); cursor: pointer; background: none; border: none; padding: 0; text-decoration: underline; }
-  .override-row { display: flex; gap: 8px; margin-top: 8px; }
-  .override-row input { flex: 1; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
-  .override-row input[type=number] { width: 80px; flex: none; }
-  .override-add { font-size: 12px; color: var(--blue); background: none; border: none; cursor: pointer; padding: 0; margin-top: 6px; }
   @media (max-width: 500px) { .steps { grid-template-columns: 1fr; } h1 { font-size: 22px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>
 </head>
@@ -119,15 +113,6 @@
       <input type="file" id="file-input" accept=".zip,.pdf" multiple style="display:none" onchange="filesSelected(this.files)">
     </div>
     <div id="file-list"></div>
-
-    <div class="override-section">
-      <button class="override-toggle" onclick="toggleOverrides()">⚙ Weight overrides (optional)</button>
-      <div id="override-area" style="display:none">
-        <p style="font-size:11px;color:var(--muted);margin-top:6px">If you know a label weight is wrong, enter the correct weight here before processing.</p>
-        <div id="override-rows"></div>
-        <button class="override-add" onclick="addOverrideRow()">+ Add SKU override</button>
-      </div>
-    </div>
 
     <button id="process-btn" onclick="startProcessing()">
       ▶ Click to start processing
@@ -212,7 +197,6 @@ async function startProcessing() {
   const form = new FormData();
   // If single ZIP, send as-is. If PDFs, send all.
   for (let f of selectedFiles) form.append('files', f);
-  form.append('weight_overrides', JSON.stringify(getWeightOverrides()));
 
   try {
     const res = await fetch('/upload', { method: 'POST', body: form });
@@ -276,33 +260,6 @@ function downloadResult() {
   if (currentJobId) window.location.href = '/download/' + currentJobId;
 }
 
-
-function toggleOverrides() {
-  const area = document.getElementById('override-area');
-  area.style.display = area.style.display === 'none' ? 'block' : 'none';
-  if (area.style.display === 'block' && document.getElementById('override-rows').children.length === 0) {
-    addOverrideRow();
-  }
-}
-
-function addOverrideRow() {
-  const row = document.createElement('div');
-  row.className = 'override-row';
-  row.innerHTML = `<input type="text" placeholder="SKU (e.g. BD-6372=P4)"><input type="number" step="0.01" min="0.1" max="30" placeholder="kg">
-    <button onclick="this.parentElement.remove()" style="padding:4px 8px;background:var(--red-bg);color:var(--red);border:none;border-radius:4px;cursor:pointer">✕</button>`;
-  document.getElementById('override-rows').appendChild(row);
-}
-
-function getWeightOverrides() {
-  const overrides = {};
-  document.querySelectorAll('#override-rows .override-row').forEach(row => {
-    const inputs = row.querySelectorAll('input');
-    const sku = inputs[0].value.trim();
-    const weight = inputs[1].value.trim();
-    if (sku && weight) overrides[sku] = weight;
-  });
-  return overrides;
-}
 
 function resetApp() {
   selectedFiles = [];
