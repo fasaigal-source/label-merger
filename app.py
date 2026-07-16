@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os, re, io, json, zipfile, tempfile, threading, uuid, string, html as html_module
 from pathlib import Path
-from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, send_file, render_template, session, redirect, url_for
 from pdf2image import convert_from_path
@@ -41,15 +40,6 @@ def init_db():
         cur.execute('''
             INSERT INTO batch_counter (id, value) VALUES (1, 0)
             ON CONFLICT (id) DO NOTHING
-        ''')
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS sku_weights (
-                sku TEXT PRIMARY KEY,
-                typical_weight REAL NOT NULL,
-                weights JSONB NOT NULL DEFAULT '[]',
-                count INTEGER NOT NULL DEFAULT 0,
-                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-            )
         ''')
         cur.execute('''
             CREATE TABLE IF NOT EXISTS sku_aliases (
@@ -102,130 +92,6 @@ def get_next_batch_id():
     except Exception as e:
         print(f"Batch counter error: {e}")
         return 'A'
-
-
-# ── SKU WEIGHT MEMORY ────────────────────────────────────────────────────────
-
-def update_sku_weight(sku, weight_kg):
-    """Update weight memory for a SKU."""
-    if not sku or not weight_kg or sku in ('NOT FOUND', 'ERROR'):
-        return
-    try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM sku_weights WHERE sku = %s', (sku,))
-        row = cur.fetchone()
-        if row:
-            weights = row['weights']
-            weights.append(weight_kg)
-            weights = weights[-20:]  # Keep last 20
-            from collections import Counter
-            typical = Counter([round(w, 1) for w in weights]).most_common(1)[0][0]
-            cur.execute('''
-                UPDATE sku_weights 
-                SET weights = %s, typical_weight = %s, count = %s, updated_at = NOW()
-                WHERE sku = %s
-            ''', (json.dumps(weights), typical, len(weights), sku))
-        else:
-            cur.execute('''
-                INSERT INTO sku_weights (sku, typical_weight, weights, count, updated_at)
-                VALUES (%s, %s, %s, 1, NOW())
-            ''', (sku, weight_kg, json.dumps([weight_kg])))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"SKU weight update error: {e}")
-
-def purge_old_weights():
-    """Remove SKU weight records older than 4 weeks."""
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cutoff = datetime.now() - timedelta(weeks=4)
-        cur.execute('DELETE FROM sku_weights WHERE updated_at < %s', (cutoff,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"Purge error: {e}")
-
-def check_weight_anomaly(sku, weight_kg):
-    """Returns warning string if weight suggests wrong qty, else None.
-    Uses ±35% natural variation buffer, flags near-double/triple ratios."""
-    if not sku or not weight_kg:
-        return None
-    try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM sku_weights WHERE sku = %s', (sku,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if not row or row['count'] < 3:
-            return None
-        typical = row['typical_weight']
-        if typical <= 0:
-            return None
-        ratio = weight_kg / typical
-        # ±35% natural variation = 0.65 to 1.35 → ignore
-        # Gap zone 1.35 to 1.65 → ignore (ambiguous)
-        # Near double 1.65 to 2.35 → flag qty=2
-        # Gap zone 2.35 to 2.65 → ignore
-        # Near triple 2.65 to 3.35 → flag qty=3
-        if 1.65 <= ratio <= 2.35:
-            return f'WEIGHT {weight_kg}kg vs typical {typical}kg — expected qty ~2?'
-        elif 2.65 <= ratio <= 3.35:
-            return f'WEIGHT {weight_kg}kg vs typical {typical}kg — expected qty ~3?'
-        return None
-    except Exception as e:
-        print(f"Weight anomaly check error: {e}")
-        return None
-
-def get_all_sku_weights():
-    """Get all SKU weight records for admin page."""
-    try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM sku_weights ORDER BY sku')
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return rows
-    except Exception as e:
-        print(f"Get SKU weights error: {e}")
-        return []
-
-def update_sku_weight_manual(sku, new_weight):
-    """Manually set typical weight for a SKU."""
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('''
-            UPDATE sku_weights SET typical_weight = %s, updated_at = NOW()
-            WHERE sku = %s
-        ''', (new_weight, sku))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"Manual weight update error: {e}")
-        return False
-
-def delete_sku_weight(sku):
-    """Delete a SKU weight record."""
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('DELETE FROM sku_weights WHERE sku = %s', (sku,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"Delete SKU weight error: {e}")
-        return False
 
 
 # ── SKU ALIAS / CANONICAL MAPPING ────────────────────────────────────────────
@@ -340,40 +206,6 @@ def get_all_aliases():
         print(f"Get aliases error: {e}")
         return {}
 
-def merge_weight_history(from_sku, to_sku):
-    """Fold from_sku's weight history into to_sku's (Option A: retroactive merge)."""
-    try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM sku_weights WHERE sku = %s', (from_sku,))
-        old = cur.fetchone()
-        if not old:
-            cur.close()
-            conn.close()
-            return
-        cur.execute('SELECT * FROM sku_weights WHERE sku = %s', (to_sku,))
-        target = cur.fetchone()
-        combined = (target['weights'] if target else []) + old['weights']
-        combined = combined[-20:]
-        from collections import Counter
-        typical = Counter([round(w, 1) for w in combined]).most_common(1)[0][0]
-        if target:
-            cur.execute('''
-                UPDATE sku_weights SET weights = %s, typical_weight = %s, count = %s, updated_at = NOW()
-                WHERE sku = %s
-            ''', (json.dumps(combined), typical, len(combined), to_sku))
-        else:
-            cur.execute('''
-                INSERT INTO sku_weights (sku, typical_weight, weights, count, updated_at)
-                VALUES (%s, %s, %s, %s, NOW())
-            ''', (to_sku, typical, json.dumps(combined), len(combined)))
-        cur.execute('DELETE FROM sku_weights WHERE sku = %s', (from_sku,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"Weight history merge error: {e}")
-
 def find_existing_canonical(canonical_sku):
     """Case-insensitive lookup: if a canonical SKU already exists that matches except for case,
     return its exact stored form so we reuse it instead of creating a near-duplicate group."""
@@ -395,7 +227,7 @@ def find_existing_canonical(canonical_sku):
         return None
 
 def confirm_sku_alias(raw_sku, canonical_sku):
-    """Add a confirmed mapping, remove it from the unmapped queue, and merge weight history."""
+    """Add a confirmed mapping and remove it from the unmapped queue."""
     key = normalize_sku_key(raw_sku)
     if not key or not canonical_sku:
         return False
@@ -417,8 +249,6 @@ def confirm_sku_alias(raw_sku, canonical_sku):
         conn.commit()
         cur.close()
         conn.close()
-        if raw_sku != canonical_sku:
-            merge_weight_history(raw_sku, canonical_sku)
         return True
     except Exception as e:
         print(f"Confirm alias error: {e}")
@@ -503,25 +333,6 @@ def is_royal_mail_label(page_image):
     text = pytesseract.image_to_string(page_image)
     return bool(re.search(r'Royal\s*Mail|Delivered\s+by|Post\s+by\s+the\s+end', text, re.IGNORECASE))
 
-def extract_weight_from_label(page_image):
-    """Extract weight in KG from Evri label - specifically from Weight in KG field only."""
-    text = pytesseract.image_to_string(page_image)
-    # Must be on same line as "Weight in KG" and be a decimal number
-    # Excludes dates (DD/MM/YYYY) by requiring optional decimal point pattern
-    m = re.search(r'Weight\s+in\s+KG\s*[:\|]?\s*([\d]+\.[\d]+|[\d]+)\s*(?:\n|$)', text, re.IGNORECASE)
-    if m:
-        val = m.group(1)
-        # Reject if it looks like a date component (e.g. 16 from 16/06/2026)
-        # Real weights are usually between 0.1 and 30 kg
-        try:
-            w = float(val)
-            if 0.1 <= w <= 30:
-                return w
-        except:
-            pass
-    return None
-
-
 # ── QTY EXTRACTION ───────────────────────────────────────────────────────────
 
 def extract_skus_on_page(page):
@@ -590,20 +401,24 @@ def find_qty_from_column(page):
 
 # ── PDF EXTRACTION ────────────────────────────────────────────────────────────
 
-def extract_items_from_pdf(pdf_path, weight_overrides=None):
+def extract_items_from_pdf(pdf_path):
     pages = convert_from_path(str(pdf_path), dpi=300)
     if len(pages) < 2:
-        return [], '', False, None, False
+        return [], '', False, False
 
     rm_label = is_royal_mail_label(pages[0])
-    label_weight = extract_weight_from_label(pages[0])
 
     full_text = ''
     for p in pages[1:]:
         full_text += pytesseract.image_to_string(p) + '\n'
 
     is_business = bool(re.search(r'Amazon\s+[Bb]usiness|Packing\s+slip|Order\s+#:', full_text))
-    order_match = re.search(r'Order\s+(?:ID|#)[:\s#]*([0-9]{3}-[0-9]{7}-[0-9]{7})', full_text)
+    # On Prime slips "/Prime" butts straight up against the last digit, and OCR
+    # sometimes splits the digit run: "205-8954605-95651 19/Prime". Collapse any
+    # space sitting between two digits before matching. Scoped to this lookup only
+    # so SKU extraction below still sees the original full_text.
+    order_text = re.sub(r'(?<=\d)[ \t]+(?=\d)', '', full_text)
+    order_match = re.search(r'Order\s+(?:ID|#)[:\s#]*([0-9]{3}-[0-9]{7}-[0-9]{7})', order_text)
     order_id = order_match.group(1) if order_match else ''
 
     all_qtys = []
@@ -656,17 +471,13 @@ def extract_items_from_pdf(pdf_path, weight_overrides=None):
                 else:
                     qty = '1'
 
-        # Apply weight override if provided
-        if weight_overrides and sku in weight_overrides:
-            label_weight = weight_overrides[sku]
-
         canonical_sku, was_mapped = get_canonical_sku(sku)
         item = {'sku': canonical_sku, 'qty': qty}
         if was_mapped:
             item['raw_sku'] = sku
         items.append(item)
 
-    return items, order_id, rm_label, label_weight, qty_confident
+    return items, order_id, rm_label, qty_confident
 
 
 # ── OVERLAY FUNCTIONS ─────────────────────────────────────────────────────────
@@ -761,13 +572,12 @@ def create_royal_mail_overlay(items, order_id, page_num, total_pages, batch_id, 
 
 # ── JOB RUNNER ───────────────────────────────────────────────────────────────
 
-def run_job(job_id, pdf_files, tmpdir, weight_overrides=None):
+def run_job(job_id, pdf_files, tmpdir):
     def update(progress, message):
         with jobs_lock:
             jobs[job_id]['progress'] = progress
             jobs[job_id]['message'] = message
 
-    purge_old_weights()
     batch_id = get_next_batch_id()
     total = len(pdf_files)
     update(0, 'Batch ' + batch_id + ' — reading ' + str(total) + ' order(s)...')
@@ -777,23 +587,17 @@ def run_job(job_id, pdf_files, tmpdir, weight_overrides=None):
         fname = Path(pdf_path).name
         update(int((i / total) * 40), 'Reading ' + str(i+1) + '/' + str(total) + ': ' + fname)
         try:
-            items, order_id, rm_label, label_weight, qty_confident = extract_items_from_pdf(
-                pdf_path, weight_overrides)
+            items, order_id, rm_label, qty_confident = extract_items_from_pdf(pdf_path)
             if not items:
                 items = [{'sku': 'NOT FOUND', 'qty': '?'}]
 
-            weight_warning = None
-            if label_weight and items:
-                primary_sku = items[0]['sku']
-                weight_warning = check_weight_anomaly(primary_sku, label_weight)
-
-            needs_check = not qty_confident or bool(weight_warning)
+            needs_check = not qty_confident
 
             extracted.append({
                 'path': pdf_path, 'file': fname,
                 'items': items, 'order_id': order_id,
-                'rm_label': rm_label, 'label_weight': label_weight,
-                'qty_confident': qty_confident, 'weight_warning': weight_warning,
+                'rm_label': rm_label,
+                'qty_confident': qty_confident,
                 'needs_check': needs_check,
                 'sort_key': items[0]['sku'].upper() if items else 'ZZZZ'
             })
@@ -801,8 +605,8 @@ def run_job(job_id, pdf_files, tmpdir, weight_overrides=None):
             extracted.append({
                 'path': pdf_path, 'file': fname,
                 'items': [{'sku': 'ERROR', 'qty': '?'}],
-                'order_id': '', 'rm_label': False, 'label_weight': None,
-                'qty_confident': False, 'weight_warning': None, 'needs_check': False,
+                'order_id': '', 'rm_label': False,
+                'qty_confident': False, 'needs_check': False,
                 'sort_key': 'ZZZZ', 'error': str(e)
             })
 
@@ -837,17 +641,9 @@ def run_job(job_id, pdf_files, tmpdir, weight_overrides=None):
             label_page.merge_page(overlay_reader.pages[0])
             writer.add_page(label_page)
 
-            # Update weight memory
-            if entry['label_weight'] and entry['items']:
-                primary_sku = entry['items'][0]['sku']
-                if primary_sku not in ('NOT FOUND', 'ERROR'):
-                    update_sku_weight(primary_sku, entry['label_weight'])
-
             warn_reason = []
             if not entry['qty_confident']:
                 warn_reason.append('qty unconfirmed')
-            if entry['weight_warning']:
-                warn_reason.append(entry['weight_warning'])
 
             results.append({
                 'file': entry['file'], 'status': 'ok',
@@ -894,16 +690,6 @@ def upload():
     tmpdir = tempfile.mkdtemp()
     pdf_files = []
 
-    # Parse weight overrides from form
-    weight_overrides = {}
-    overrides_raw = request.form.get('weight_overrides', '')
-    if overrides_raw:
-        try:
-            weight_overrides = json.loads(overrides_raw)
-            weight_overrides = {k: float(v) for k, v in weight_overrides.items() if v}
-        except:
-            pass
-
     uploaded = request.files.getlist('files') or request.files.getlist('file')
     if not uploaded:
         return jsonify({'error': 'No file uploaded'}), 400
@@ -929,7 +715,7 @@ def upload():
             'message': 'Starting — ' + str(len(pdf_files)) + ' PDF(s) found...',
             'result_path': None, 'results': [], 'batch_id': '', 'download_name': 'merged_labels.pdf'
         }
-    t = threading.Thread(target=run_job, args=(job_id, pdf_files, tmpdir, weight_overrides))
+    t = threading.Thread(target=run_job, args=(job_id, pdf_files, tmpdir))
     t.daemon = True
     t.start()
     return jsonify({'job_id': job_id, 'total': len(pdf_files)})
@@ -1020,27 +806,6 @@ def render_group_html(g_idx, canonical, variants):
 @app.route('/admin')
 @admin_required
 def admin():
-    rows = get_all_sku_weights()
-    rows_html = ''
-    for idx, r in enumerate(rows):
-        weights_preview = ', '.join([str(w) for w in r['weights'][-5:]])
-        sku_safe = esc_html(r['sku'])
-        rows_html += f'''
-        <tr id="row-{idx}" data-sku="{sku_safe}">
-          <td style="font-weight:600">{sku_safe}</td>
-          <td>
-            <input type="number" step="0.01" value="{r['typical_weight']}" 
-                   id="w-{idx}" style="width:80px;padding:4px;border:1px solid #ddd;border-radius:4px">
-            <button onclick="saveWeight({idx})" style="padding:4px 10px;background:#166534;color:white;border:none;border-radius:4px;cursor:pointer;margin-left:4px">Save</button>
-          </td>
-          <td>{r['count']}</td>
-          <td style="color:#666;font-size:12px">{esc_html(weights_preview)}</td>
-          <td>{str(r['updated_at'])[:10]}</td>
-          <td>
-            <button onclick="deleteSku({idx})" style="padding:4px 10px;background:#991b1b;color:white;border:none;border-radius:4px;cursor:pointer">Delete</button>
-          </td>
-        </tr>'''
-
     unmapped = get_unmapped_skus()
     unmapped_html = ''
     all_canonicals_for_options = sorted(get_all_aliases().keys())
@@ -1137,18 +902,7 @@ def admin():
       </div>
       <div id="msg" class="msg"></div>
 
-      <div class="tabs">
-        <div class="tab active" onclick="switchTab('weights')">SKU Weight Memory</div>
-        <div class="tab" onclick="switchTab('aliases')">SKU Aliases</div>
-      </div>
-
-      <div id="panel-weights" class="panel active">
-        <p class="sub">Weights auto-expire after 4 weeks. Edit typical weight or delete a SKU to reset its memory.</p>
-        {"<p class='empty-note'>No SKU weight data yet — process some batches first.</p>" if not rows else ""}
-        {"<table><thead><tr><th>SKU</th><th>Typical Weight (kg)</th><th>Seen</th><th>Recent weights</th><th>Last updated</th><th>Action</th></tr></thead><tbody>" + rows_html + "</tbody></table>" if rows else ""}
-      </div>
-
-      <div id="panel-aliases" class="panel">
+      <div id="panel-aliases" class="panel active">
         <p class="sub">Duplicate Amazon listings (e.g. HF-P2Px3~, HF-P2Px3*) can be mapped to one canonical SKU. Nothing merges automatically — click SKUs below to select them, set the master SKU, then confirm.</p>
         <input type="text" class="search-box" id="alias-search" placeholder="Search SKU or canonical name..." oninput="filterAliases()">
         <datalist id="canonical-options">{datalist_html}</datalist>
@@ -1189,17 +943,6 @@ def admin():
           m.style.color = ok ? '#166534' : '#991b1b';
           setTimeout(() => m.style.display = 'none', 3000);
         }}
-        function switchTab(name) {{
-          document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-          document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-          document.querySelector('.tab[onclick*="' + name + '"]').classList.add('active');
-          document.getElementById('panel-' + name).classList.add('active');
-          sessionStorage.setItem('admin-active-tab', name);
-        }}
-        (function restoreTab() {{
-          const saved = sessionStorage.getItem('admin-active-tab');
-          if (saved === 'aliases') switchTab('aliases');
-        }})();
         (function restoreScroll() {{
           const y = sessionStorage.getItem('admin-scroll-y');
           if (y) {{ window.scrollTo(0, parseInt(y)); sessionStorage.removeItem('admin-scroll-y'); }}
@@ -1216,32 +959,6 @@ def admin():
           document.querySelectorAll('#groups-list .alias-group').forEach(el => {{
             el.style.display = (!q || el.dataset.search.includes(q)) ? '' : 'none';
           }});
-        }}
-        async function saveWeight(idx) {{
-          const sku = document.getElementById('row-' + idx).dataset.sku;
-          const val = document.getElementById('w-' + idx).value;
-          const res = await fetch('/admin/update-weight', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify({{sku, weight: parseFloat(val)}})
-          }});
-          const data = await res.json();
-          showMsg(data.ok ? '✓ Weight updated for ' + sku : '✗ Error: ' + data.error, data.ok);
-        }}
-        async function deleteSku(idx) {{
-          const row = document.getElementById('row-' + idx);
-          const sku = row.dataset.sku;
-          if (!confirm('Delete weight history for ' + sku + '?')) return;
-          const res = await fetch('/admin/delete-sku', {{
-            method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
-            body: JSON.stringify({{sku}})
-          }});
-          const data = await res.json();
-          if (data.ok) {{
-            row.remove();
-            showMsg('✓ Deleted ' + sku);
-          }} else showMsg('✗ Error: ' + data.error, false);
         }}
         // ── Selection tray (click-to-select, with drag-and-drop as a secondary option) ──
         let trayItems = {{}}; // key -> rawSku
@@ -1490,27 +1207,6 @@ def admin():
         }}
       </script>
     </body></html>'''
-
-@app.route('/admin/update-weight', methods=['POST'])
-@admin_required
-def admin_update_weight():
-    data = request.json
-    sku = data.get('sku')
-    weight = data.get('weight')
-    if not sku or not weight:
-        return jsonify({'ok': False, 'error': 'Missing SKU or weight'})
-    ok = update_sku_weight_manual(sku, weight)
-    return jsonify({'ok': ok})
-
-@app.route('/admin/delete-sku', methods=['POST'])
-@admin_required
-def admin_delete_sku():
-    data = request.json
-    sku = data.get('sku')
-    if not sku:
-        return jsonify({'ok': False, 'error': 'Missing SKU'})
-    ok = delete_sku_weight(sku)
-    return jsonify({'ok': ok})
 
 @app.route('/admin/confirm-alias', methods=['POST'])
 @admin_required
