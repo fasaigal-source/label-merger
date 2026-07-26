@@ -296,6 +296,27 @@ def update_sku_alias_canonical(alias_id, new_canonical):
         print(f"Update alias canonical error: {e}")
         return False
 
+def rename_canonical_sku(old_canonical, new_canonical):
+    """Rename every alias row under old_canonical to new_canonical. If new_canonical
+    already exists as a different group (case-insensitive), merges into that group
+    instead of creating a near-duplicate."""
+    new_canonical = (new_canonical or '').strip()
+    if not old_canonical or not new_canonical or old_canonical == new_canonical:
+        return False
+    existing = find_existing_canonical(new_canonical)
+    target = existing if (existing and existing != old_canonical) else new_canonical
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('UPDATE sku_aliases SET canonical_sku = %s WHERE canonical_sku = %s', (target, old_canonical))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Rename canonical error: {e}")
+        return False
+
 
 # ── ADMIN HTML SAFETY HELPERS ────────────────────────────────────────────────
 # SKUs come from OCR and can contain quotes, ampersands, etc. (e.g. 19" x 29" x 6).
@@ -935,6 +956,7 @@ def render_group_html(g_idx, canonical, variants):
              ondragover="onGroupDragOver(event)" ondragleave="onGroupDragLeave(event)" ondrop="onGroupDrop(event, this)">
           <div class="group-top-row">
             <span class="canonical-name" title="{canonical_safe}">{canonical_safe}</span>
+            <button class="rename-btn" onclick="renameCanonical(event, this)" title="Rename this canonical SKU">✎</button>
             <button class="add-here-btn" onclick="addSelectedToGroup(event, this)" title="Add currently selected SKUs to this group">+ Add</button>
           </div>
           <span class="variant-chips">{variant_chips}</span>
@@ -1032,6 +1054,8 @@ def admin():
       .variant-chip:hover .variant-x {{ opacity: 1; width: 12px; }}
       .add-here-btn {{ font-size: 11px; padding: 3px 8px; background: #1a1916; color: white; border: none; border-radius: 10px; cursor: pointer; opacity: 0.4; pointer-events: none; white-space: nowrap; flex-shrink: 0; }}
       .add-here-btn.armed {{ opacity: 1; pointer-events: auto; background: #166534; }}
+      .rename-btn {{ font-size: 12px; padding: 2px 6px; background: none; color: #999; border: 1px solid #e5e3da; border-radius: 6px; cursor: pointer; flex-shrink: 0; line-height: 1.4; }}
+      .rename-btn:hover {{ color: #1a1916; border-color: #bbb; background: #f5f4f0; }}
       .empty-note {{ color: #888; font-size: 13px; }}
     </style></head>
     <body>
@@ -1238,6 +1262,29 @@ def admin():
           if (lastFragment) patchGroupFragment(resolvedCanonical, lastFragment);
           updateUnmappedCount();
         }}
+        async function renameCanonical(e, btn) {{
+          e.preventDefault();
+          e.stopPropagation();
+          const groupEl = btn.closest('.alias-group');
+          const oldCanonical = groupEl.dataset.canonical;
+          const newCanonical = prompt('Rename "' + oldCanonical + '" to:', oldCanonical);
+          if (!newCanonical || newCanonical.trim() === '' || newCanonical.trim() === oldCanonical) return;
+          const res = await fetch('/admin/rename-canonical', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{old_canonical: oldCanonical, new_canonical: newCanonical.trim()}})
+          }});
+          const data = await res.json();
+          if (data.ok) {{
+            groupEl.remove();
+            patchGroupFragment(data.canonical_sku, data.fragment);
+            if (data.merged_into_existing) {{
+              showMsg('✓ Renamed → merged into existing group "' + data.canonical_sku + '"');
+            }} else {{
+              showMsg('✓ Renamed to "' + data.canonical_sku + '"');
+            }}
+          }} else showMsg('✗ Error: ' + data.error, false);
+        }}
         function patchGroupFragment(canonical, fragmentHtml) {{
           const groupsList = document.getElementById('groups-list');
           const emptyNote = groupsList.querySelector('.empty-note');
@@ -1347,6 +1394,31 @@ def admin():
         }}
       </script>
     </body></html>'''
+
+@app.route('/admin/rename-canonical', methods=['POST'])
+@admin_required
+def admin_rename_canonical():
+    data = request.json
+    old_canonical = data.get('old_canonical')
+    new_canonical = (data.get('new_canonical') or '').strip()
+    if not old_canonical or not new_canonical:
+        return jsonify({'ok': False, 'error': 'Missing old_canonical or new_canonical'})
+    if new_canonical == old_canonical:
+        return jsonify({'ok': False, 'error': 'That is already the current name'})
+    existing = find_existing_canonical(new_canonical)
+    resolved_canonical = existing if (existing and existing != old_canonical) else new_canonical
+    ok = rename_canonical_sku(old_canonical, new_canonical)
+    if not ok:
+        return jsonify({'ok': False, 'error': 'Could not rename'})
+    variants = get_alias_variants_for_canonical(resolved_canonical)
+    all_canonicals = sorted(get_all_aliases().keys())
+    g_idx = all_canonicals.index(resolved_canonical) if resolved_canonical in all_canonicals else len(all_canonicals)
+    fragment = render_group_html(g_idx, resolved_canonical, variants)
+    merged_into_existing = bool(existing) and existing != old_canonical
+    return jsonify({
+        'ok': True, 'canonical_sku': resolved_canonical, 'fragment': fragment,
+        'merged_into_existing': merged_into_existing
+    })
 
 @app.route('/admin/confirm-alias', methods=['POST'])
 @admin_required
