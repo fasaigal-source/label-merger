@@ -1037,6 +1037,8 @@ def admin():
       .tray-master-row {{ margin-top: 12px; padding-top: 12px; border-top: 1px solid #e5e3da; }}
       .tray-master-input-wrap {{ display: flex; align-items: center; gap: 8px; }}
       .tray-master-label {{ font-size: 13px; font-weight: 600; color: #555; }}
+      .manual-map-box {{ border: 1px solid #e5e3da; border-radius: 10px; padding: 12px 14px; margin-bottom: 1.2rem; background: #fafaf8; }}
+      .manual-map-input {{ padding: 7px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; flex: 1; min-width: 0; }}
       #tray-master-input {{ flex: 1; max-width: 260px; padding: 7px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; }}
       .master-match-hint {{ font-size: 12px; margin: 6px 0 0; padding: 5px 10px; border-radius: 6px; }}
       .master-match-hint.match {{ background: #dbeafe; color: #1e40af; }}
@@ -1083,6 +1085,15 @@ def admin():
               <button onclick="clearTray()" style="padding:6px 10px;background:#888;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px">Clear</button>
             </div>
             <p id="master-match-hint" class="master-match-hint" style="display:none"></p>
+          </div>
+        </div>
+
+        <div class="manual-map-box">
+          <p class="tray-label">Manually map a SKU — for one you've already dismissed, or haven't seen yet</p>
+          <div class="tray-master-input-wrap">
+            <input type="text" id="manual-raw-input" class="manual-map-input" placeholder="Raw SKU (exact, e.g. BD6372-P4)">
+            <input type="text" id="manual-canonical-input" class="manual-map-input" list="canonical-options" placeholder="Canonical SKU">
+            <button onclick="manualMapSku()" style="padding:7px 14px;background:#166534;color:white;border:none;border-radius:6px;cursor:pointer;font-size:13px;flex-shrink:0">Map</button>
           </div>
         </div>
 
@@ -1261,6 +1272,32 @@ def admin():
           }}
           if (lastFragment) patchGroupFragment(resolvedCanonical, lastFragment);
           updateUnmappedCount();
+        }}
+        async function manualMapSku() {{
+          const rawInput = document.getElementById('manual-raw-input');
+          const canonicalInput = document.getElementById('manual-canonical-input');
+          const raw = rawInput.value.trim();
+          const canonical = canonicalInput.value.trim();
+          if (!raw || !canonical) {{ showMsg('✗ Enter both a raw SKU and a canonical SKU', false); return; }}
+          const res = await fetch('/admin/confirm-alias', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{raw_sku: raw, canonical_sku: canonical}})
+          }});
+          const data = await res.json();
+          if (data.ok) {{
+            patchGroupFragment(data.canonical_sku, data.fragment);
+            // in case it was still sitting (undismissed) in the unmapped queue, clear that chip too
+            const chip = Array.from(document.querySelectorAll('#unmapped-list .sku-chip')).find(c => c.dataset.raw === raw);
+            if (chip) chip.remove();
+            updateUnmappedCount();
+            rawInput.value = ''; canonicalInput.value = '';
+            if (data.merged_into_existing) {{
+              showMsg('✓ Mapped "' + raw + '" → existing group "' + data.canonical_sku + '"');
+            }} else {{
+              showMsg('✓ Mapped "' + raw + '" → ' + data.canonical_sku);
+            }}
+          }} else showMsg('✗ Error: ' + data.error, false);
         }}
         async function renameCanonical(e, btn) {{
           e.preventDefault();
