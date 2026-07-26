@@ -586,74 +586,109 @@ def build_pick_list(extracted):
             except (ValueError, TypeError):
                 qty = 1  # non-numeric qty (e.g. '?') still counts as 1 unit
             totals[sku] = totals.get(sku, 0) + qty
-    return [{'sku': sku, 'qty': qty} for sku, qty in sorted(totals.items(), key=lambda kv: kv[0].upper())]
+    pick_list = []
+    for sku, qty in sorted(totals.items(), key=lambda kv: kv[0].upper()):
+        p_match = re.search(r'P(\d+)$', sku)
+        total = int(p_match.group(1)) * qty if p_match else None
+        pick_list.append({'sku': sku, 'qty': qty, 'total': total})
+    return pick_list
 
 
 def create_pick_list_page(pick_list, batch_id, total_orders, page_w=288, page_h=432):
     """Build a printable summary page (default 4x6, same size as the courier
-    labels) listing total qty per SKU for the batch, as a ruled table."""
+    labels) listing total qty per SKU for the batch, as a ruled table.
+    Automatically splits into side-by-side columns so the batch fits on one
+    page where possible, only spilling to another page if it's too big even
+    for that."""
     margin = 10
     left = margin
     right = page_w - margin
-    qty_col_w = 30
-    divider_x = left + qty_col_w
-    sku_col_x = divider_x + 6
+    avail_w = right - left
+    row_h = 13
+    qty_col_w = 22
+    total_col_w = 28
+    col_gap = 10
+    min_col_w = 110  # below this, SKU text has no room left to breathe
 
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
 
-    def draw_header(remaining_note=None):
+    def draw_page_header(remaining_note=None):
         c.setFillColorRGB(0, 0, 0)
         c.setFont('Helvetica-Bold', 13)
-        title = 'Pick List' + (remaining_note or '')
-        c.drawString(left, page_h - 16, title)
+        c.drawString(left, page_h - 16, 'Pick List' + (remaining_note or ''))
         c.setFont('Helvetica', 7)
         c.drawString(left, page_h - 27, 'Batch ' + batch_id)
         total_items = sum(p['qty'] for p in pick_list)
         c.drawString(left, page_h - 37,
                      str(total_orders) + ' orders   ' + str(len(pick_list)) +
                      ' SKUs   ' + str(total_items) + ' items')
+        return page_h - 50  # y where the column tables start
 
-        header_y = page_h - 50
-        c.setFont('Helvetica-Bold', 8)
-        c.drawString(left + 2, header_y - 9, 'QTY')
-        c.drawString(sku_col_x, header_y - 9, 'SKU')
-        c.line(left, header_y - 13, right, header_y - 13)
-        return header_y - 13
+    def draw_col_header(x, col_w, y):
+        divider2_x = x + col_w - total_col_w
+        c.setFont('Helvetica-Bold', 7)
+        c.drawString(x + 2, y - 9, 'QTY')
+        c.drawString(x + qty_col_w + 4, y - 9, 'SKU')
+        c.drawString(divider2_x + 3, y - 9, 'TOTAL')
+        c.line(x, y - 13, x + col_w, y - 13)
+        return y - 13
 
-    row_h = 13
-    y_top = draw_header()
-    row_count = 0
+    table_top0 = page_h - 50
+    avail_h = table_top0 - (margin + 4)
+    max_rows_per_col = max(1, int(avail_h // row_h))
+    max_cols_by_width = max(1, int((avail_w + col_gap) // (min_col_w + col_gap)))
 
-    for item in pick_list:
-        if y_top - (row_count + 1) * row_h < margin + 4:
-            # close out the table box for this page, then start a new one
-            c.line(left, y_top - row_count * row_h, right, y_top - row_count * row_h)
-            c.rect(left, y_top - row_count * row_h, right - left, row_count * row_h, stroke=1, fill=0)
-            c.line(divider_x, y_top, divider_x, y_top - row_count * row_h)
+    num_cols = 1
+    if len(pick_list) > max_rows_per_col:
+        num_cols = -(-len(pick_list) // max_rows_per_col)  # ceil division
+        num_cols = min(num_cols, max_cols_by_width)
+    col_w = (avail_w - (num_cols - 1) * col_gap) / num_cols
+    rows_per_page = max_rows_per_col * num_cols
+
+    idx = 0
+    first_page = True
+    while idx < len(pick_list):
+        page_items = pick_list[idx: idx + rows_per_page]
+        idx += len(page_items)
+        table_top = draw_page_header(None if first_page else ' (cont.)')
+        first_page = False
+
+        chunk_size = -(-len(page_items) // num_cols)  # ceil, balances columns
+        col_start = 0
+        for col_idx in range(num_cols):
+            col_items = page_items[col_start: col_start + chunk_size]
+            col_start += chunk_size
+            if not col_items:
+                continue
+            x = left + col_idx * (col_w + col_gap)
+            divider1_x = x + qty_col_w
+            divider2_x = x + col_w - total_col_w
+            sku_x = divider1_x + 4
+            sku_max_w = divider2_x - sku_x - 4
+            y = draw_col_header(x, col_w, table_top)
+            for item in col_items:
+                row_bottom = y - row_h
+                c.setFont('Helvetica-Bold', 8)
+                c.drawString(x + 2, row_bottom + 4, str(item['qty']) + 'x')
+                sku_text = item['sku']
+                fs = 8
+                while c.stringWidth(sku_text, 'Helvetica', fs) > sku_max_w and fs > 5:
+                    fs -= 0.5
+                c.setFont('Helvetica', fs)
+                c.drawString(sku_x, row_bottom + 4, sku_text)
+                total_val = item.get('total')
+                if total_val is not None:
+                    c.setFont('Helvetica-Bold', 8)
+                    c.drawString(divider2_x + 3, row_bottom + 4, str(total_val))
+                c.line(x, row_bottom, x + col_w, row_bottom)
+                y = row_bottom
+            c.rect(x, y, col_w, table_top - y, stroke=1, fill=0)
+            c.line(divider1_x, table_top, divider1_x, y)
+            c.line(divider2_x, table_top, divider2_x, y)
+
+        if idx < len(pick_list):
             c.showPage()
-            y_top = draw_header(remaining_note=' (cont.)')
-            row_count = 0
-
-        row_top = y_top - row_count * row_h
-        row_bottom = row_top - row_h
-        c.setFont('Helvetica-Bold', 8)
-        c.drawString(left + 2, row_bottom + 4, str(item['qty']) + 'x')
-        c.setFont('Helvetica', 8)
-        sku_text = item['sku']
-        max_w = right - sku_col_x - 2
-        fs = 8
-        while c.stringWidth(sku_text, 'Helvetica', fs) > max_w and fs > 5:
-            fs -= 0.5
-        c.setFont('Helvetica', fs)
-        c.drawString(sku_col_x, row_bottom + 4, sku_text)
-        c.line(left, row_bottom, right, row_bottom)
-        row_count += 1
-
-    # close out the table box for the final page
-    table_bottom = y_top - row_count * row_h
-    c.rect(left, table_bottom, right - left, row_count * row_h, stroke=1, fill=0)
-    c.line(divider_x, y_top, divider_x, table_bottom)
 
     c.save()
     packet.seek(0)
