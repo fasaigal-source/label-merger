@@ -570,6 +570,69 @@ def create_royal_mail_overlay(items, order_id, page_num, total_pages, batch_id, 
     return packet
 
 
+# ── PICK LIST ──────────────────────────────────────────────────────────────────
+
+def build_pick_list(extracted):
+    """Aggregate total quantity per SKU across the whole batch, so a picker
+    can grab everything needed from stock before packing individual orders."""
+    totals = {}
+    for entry in extracted:
+        for item in entry.get('items', []):
+            sku = item.get('sku', '')
+            if not sku or sku in ('NOT FOUND', 'ERROR'):
+                continue
+            try:
+                qty = int(item.get('qty', 0))
+            except (ValueError, TypeError):
+                qty = 1  # non-numeric qty (e.g. '?') still counts as 1 unit
+            totals[sku] = totals.get(sku, 0) + qty
+    return [{'sku': sku, 'qty': qty} for sku, qty in sorted(totals.items())]
+
+
+def create_pick_list_page(pick_list, batch_id, total_orders):
+    """Build a printable A4 summary page listing total qty per SKU for the batch."""
+    page_w, page_h = 595, 842  # A4 in points
+    packet = io.BytesIO()
+    c = canvas.Canvas(packet, pagesize=(page_w, page_h))
+
+    def draw_header(remaining_note=None):
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont('Helvetica-Bold', 18)
+        title = 'Pick List — Batch ' + batch_id
+        if remaining_note:
+            title += remaining_note
+        c.drawString(40, page_h - 50, title)
+        total_items = sum(p['qty'] for p in pick_list)
+        c.setFont('Helvetica', 11)
+        c.drawString(40, page_h - 72,
+                     str(total_orders) + ' order(s)  ·  ' + str(len(pick_list)) +
+                     ' SKU(s)  ·  ' + str(total_items) + ' item(s) total')
+        c.line(40, page_h - 82, page_w - 40, page_h - 82)
+        c.setFont('Helvetica-Bold', 11)
+        c.drawString(40, page_h - 104, 'QTY')
+        c.drawString(100, page_h - 104, 'SKU')
+        c.line(40, page_h - 110, page_w - 40, page_h - 110)
+        return page_h - 130
+
+    y = draw_header()
+    row_h = 20
+    c.setFont('Helvetica', 11)
+    for item in pick_list:
+        if y < 50:
+            c.showPage()
+            y = draw_header(remaining_note=' (cont.)')
+            c.setFont('Helvetica', 11)
+        c.setFont('Helvetica-Bold', 11)
+        c.drawString(40, y, str(item['qty']) + 'x')
+        c.setFont('Helvetica', 11)
+        c.drawString(100, y, item['sku'])
+        y -= row_h
+
+    c.save()
+    packet.seek(0)
+    return packet
+
+
 # ── JOB RUNNER ───────────────────────────────────────────────────────────────
 
 def run_job(job_id, pdf_files, tmpdir):
@@ -613,7 +676,14 @@ def run_job(job_id, pdf_files, tmpdir):
     update(45, 'Sorting by SKU...')
     extracted.sort(key=lambda x: (x['sort_key'], x['file']))
 
+    pick_list = build_pick_list(extracted)
+
     writer = PdfWriter()
+    if pick_list:
+        pick_list_buf = create_pick_list_page(pick_list, batch_id, len(extracted))
+        for pg in PdfReader(pick_list_buf).pages:
+            writer.add_page(pg)
+
     results = []
     total_pages = len(extracted)
 
@@ -676,6 +746,7 @@ def run_job(job_id, pdf_files, tmpdir):
         jobs[job_id]['results'] = results
         jobs[job_id]['batch_id'] = batch_id
         jobs[job_id]['download_name'] = 'labels_batch' + batch_id + '.pdf'
+        jobs[job_id]['pick_list'] = pick_list
 
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
