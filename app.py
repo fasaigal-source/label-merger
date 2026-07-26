@@ -586,47 +586,74 @@ def build_pick_list(extracted):
             except (ValueError, TypeError):
                 qty = 1  # non-numeric qty (e.g. '?') still counts as 1 unit
             totals[sku] = totals.get(sku, 0) + qty
-    return [{'sku': sku, 'qty': qty} for sku, qty in sorted(totals.items())]
+    return [{'sku': sku, 'qty': qty} for sku, qty in sorted(totals.items(), key=lambda kv: kv[0].upper())]
 
 
-def create_pick_list_page(pick_list, batch_id, total_orders):
-    """Build a printable A4 summary page listing total qty per SKU for the batch."""
-    page_w, page_h = 595, 842  # A4 in points
+def create_pick_list_page(pick_list, batch_id, total_orders, page_w=288, page_h=432):
+    """Build a printable summary page (default 4x6, same size as the courier
+    labels) listing total qty per SKU for the batch, as a ruled table."""
+    margin = 10
+    left = margin
+    right = page_w - margin
+    qty_col_w = 30
+    divider_x = left + qty_col_w
+    sku_col_x = divider_x + 6
+
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
 
     def draw_header(remaining_note=None):
         c.setFillColorRGB(0, 0, 0)
-        c.setFont('Helvetica-Bold', 18)
-        title = 'Pick List — Batch ' + batch_id
-        if remaining_note:
-            title += remaining_note
-        c.drawString(40, page_h - 50, title)
+        c.setFont('Helvetica-Bold', 13)
+        title = 'Pick List' + (remaining_note or '')
+        c.drawString(left, page_h - 16, title)
+        c.setFont('Helvetica', 7)
+        c.drawString(left, page_h - 27, 'Batch ' + batch_id)
         total_items = sum(p['qty'] for p in pick_list)
-        c.setFont('Helvetica', 11)
-        c.drawString(40, page_h - 72,
-                     str(total_orders) + ' order(s)  ·  ' + str(len(pick_list)) +
-                     ' SKU(s)  ·  ' + str(total_items) + ' item(s) total')
-        c.line(40, page_h - 82, page_w - 40, page_h - 82)
-        c.setFont('Helvetica-Bold', 11)
-        c.drawString(40, page_h - 104, 'QTY')
-        c.drawString(100, page_h - 104, 'SKU')
-        c.line(40, page_h - 110, page_w - 40, page_h - 110)
-        return page_h - 130
+        c.drawString(left, page_h - 37,
+                     str(total_orders) + ' orders   ' + str(len(pick_list)) +
+                     ' SKUs   ' + str(total_items) + ' items')
 
-    y = draw_header()
-    row_h = 20
-    c.setFont('Helvetica', 11)
+        header_y = page_h - 50
+        c.setFont('Helvetica-Bold', 8)
+        c.drawString(left + 2, header_y - 9, 'QTY')
+        c.drawString(sku_col_x, header_y - 9, 'SKU')
+        c.line(left, header_y - 13, right, header_y - 13)
+        return header_y - 13
+
+    row_h = 13
+    y_top = draw_header()
+    row_count = 0
+
     for item in pick_list:
-        if y < 50:
+        if y_top - (row_count + 1) * row_h < margin + 4:
+            # close out the table box for this page, then start a new one
+            c.line(left, y_top - row_count * row_h, right, y_top - row_count * row_h)
+            c.rect(left, y_top - row_count * row_h, right - left, row_count * row_h, stroke=1, fill=0)
+            c.line(divider_x, y_top, divider_x, y_top - row_count * row_h)
             c.showPage()
-            y = draw_header(remaining_note=' (cont.)')
-            c.setFont('Helvetica', 11)
-        c.setFont('Helvetica-Bold', 11)
-        c.drawString(40, y, str(item['qty']) + 'x')
-        c.setFont('Helvetica', 11)
-        c.drawString(100, y, item['sku'])
-        y -= row_h
+            y_top = draw_header(remaining_note=' (cont.)')
+            row_count = 0
+
+        row_top = y_top - row_count * row_h
+        row_bottom = row_top - row_h
+        c.setFont('Helvetica-Bold', 8)
+        c.drawString(left + 2, row_bottom + 4, str(item['qty']) + 'x')
+        c.setFont('Helvetica', 8)
+        sku_text = item['sku']
+        max_w = right - sku_col_x - 2
+        fs = 8
+        while c.stringWidth(sku_text, 'Helvetica', fs) > max_w and fs > 5:
+            fs -= 0.5
+        c.setFont('Helvetica', fs)
+        c.drawString(sku_col_x, row_bottom + 4, sku_text)
+        c.line(left, row_bottom, right, row_bottom)
+        row_count += 1
+
+    # close out the table box for the final page
+    table_bottom = y_top - row_count * row_h
+    c.rect(left, table_bottom, right - left, row_count * row_h, stroke=1, fill=0)
+    c.line(divider_x, y_top, divider_x, table_bottom)
 
     c.save()
     packet.seek(0)
@@ -680,7 +707,14 @@ def run_job(job_id, pdf_files, tmpdir):
 
     writer = PdfWriter()
     if pick_list:
-        pick_list_buf = create_pick_list_page(pick_list, batch_id, len(extracted))
+        label_w, label_h = 288, 432  # 4x6in fallback if the peek below fails
+        try:
+            peek_reader = PdfReader(str(extracted[0]['path']))
+            label_w = float(peek_reader.pages[0].mediabox.width)
+            label_h = float(peek_reader.pages[0].mediabox.height)
+        except Exception:
+            pass
+        pick_list_buf = create_pick_list_page(pick_list, batch_id, len(extracted), label_w, label_h)
         for pg in PdfReader(pick_list_buf).pages:
             writer.add_page(pg)
 
