@@ -87,6 +87,7 @@
   .pick-row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; background: var(--bg); margin-bottom: 5px; }
   .pick-row .pick-qty { font-weight: 700; color: var(--blue); min-width: 40px; }
   .pick-row .pick-sku { flex: 1; font-weight: 500; }
+  .pick-row .pick-total-val { font-weight: 700; color: var(--muted); min-width: 32px; text-align: right; }
   @media (max-width: 500px) { .steps { grid-template-columns: 1fr; } h1 { font-size: 22px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>
 </head>
@@ -250,7 +251,7 @@ function showResults(data) {
     const totalItems = pickList.reduce((sum, p) => sum + p.qty, 0);
     document.getElementById('pick-list-rows').innerHTML =
       `<div class="pick-total">${pickList.length} SKU${pickList.length !== 1 ? 's' : ''} · ${totalItems} item${totalItems !== 1 ? 's' : ''} total — also printed as page 1 of the PDF</div>` +
-      pickList.map(p => `<div class="pick-row"><span class="pick-qty">${p.qty}×</span><span class="pick-sku">${p.sku}</span></div>`).join('');
+      pickList.map(p => `<div class="pick-row"><span class="pick-qty">${p.qty}×</span><span class="pick-sku">${p.sku}</span><span class="pick-total-val">${p.total !== null && p.total !== undefined ? p.total : ''}</span></div>`).join('');
     plSection.style.display = 'block';
   } else {
     plSection.style.display = 'none';
