@@ -82,6 +82,11 @@
   .stat.warn .stat-num { color: var(--amber); }
   .mapped-note { font-size: 10px; color: var(--blue); background: var(--blue-bg); padding: 1px 6px; border-radius: 10px; white-space: nowrap; }
   .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 1.25rem; }
+  #pick-list-section { margin-bottom: 1.25rem; }
+  .pick-total { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .pick-row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; background: var(--bg); margin-bottom: 5px; }
+  .pick-row .pick-qty { font-weight: 700; color: var(--blue); min-width: 40px; }
+  .pick-row .pick-sku { flex: 1; font-weight: 500; }
   @media (max-width: 500px) { .steps { grid-template-columns: 1fr; } h1 { font-size: 22px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>
 </head>
@@ -132,6 +137,11 @@
       <div class="stat warn"><div class="stat-num" id="stat-warn">0</div><div class="stat-lbl">⚠ Check</div></div>
       <div class="stat err"><div class="stat-num" id="stat-err">0</div><div class="stat-lbl">Errors</div></div>
     </div>
+    <div id="pick-list-section" style="display:none;">
+      <div class="card-title">Pick List — grab before packing</div>
+      <div id="pick-list-rows"></div>
+    </div>
+
     <div id="results-list"></div>
     <button id="download-btn" onclick="downloadResult()"></button>
     <button id="reset-btn" onclick="resetApp()">Start again</button>
@@ -233,6 +243,18 @@ function showResults(data) {
   document.getElementById('stat-err').textContent = err;
   const ws = document.getElementById('stat-warn');
   if (ws) ws.textContent = warn;
+
+  const pickList = data.pick_list || [];
+  const plSection = document.getElementById('pick-list-section');
+  if (pickList.length) {
+    const totalItems = pickList.reduce((sum, p) => sum + p.qty, 0);
+    document.getElementById('pick-list-rows').innerHTML =
+      `<div class="pick-total">${pickList.length} SKU${pickList.length !== 1 ? 's' : ''} · ${totalItems} item${totalItems !== 1 ? 's' : ''} total — also printed as page 1 of the PDF</div>` +
+      pickList.map(p => `<div class="pick-row"><span class="pick-qty">${p.qty}×</span><span class="pick-sku">${p.sku}</span></div>`).join('');
+    plSection.style.display = 'block';
+  } else {
+    plSection.style.display = 'none';
+  }
   document.getElementById('results-list').innerHTML = results.map(r => {
     const skuText = r.items ? r.items.map(i => i.qty + '× ' + i.sku).join(' | ') : (r.error || '');
     const mappedItems = r.items ? r.items.filter(i => i.raw_sku) : [];
