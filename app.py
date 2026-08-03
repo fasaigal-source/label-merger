@@ -2,6 +2,8 @@
 import os, re, io, json, zipfile, tempfile, threading, uuid, string, html as html_module
 from pathlib import Path
 from functools import wraps
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, send_file, render_template, session, redirect, url_for
 from pdf2image import convert_from_path
 from pypdf import PdfReader, PdfWriter
@@ -634,12 +636,15 @@ def create_pick_list_page(pick_list, batch_id, total_orders, page_w=288, page_h=
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
 
+    printed_at = datetime.now(ZoneInfo('Europe/London')).strftime('%d %b %Y, %H:%M')
+
     def draw_page_header(remaining_note=None):
         c.setFillColorRGB(0, 0, 0)
         c.setFont('Helvetica-Bold', 13)
         c.drawString(left, page_h - 16, 'Pick List' + (remaining_note or ''))
         c.setFont('Helvetica', 7)
         c.drawString(left, page_h - 27, 'Batch ' + batch_id)
+        c.drawRightString(right, page_h - 27, 'Printed ' + printed_at)
         total_items = sum(p['qty'] for p in pick_list)
         c.drawString(left, page_h - 37,
                      str(total_orders) + ' orders   ' + str(len(pick_list)) +
