@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-import os, re, io, json, zipfile, tempfile, threading, uuid, string, html as html_module
+import os, re, io, csv, json, zipfile, tempfile, threading, uuid, string, html as html_module
 from pathlib import Path
 from functools import wraps
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from flask import Flask, request, jsonify, send_file, render_template, session, redirect, url_for
+from flask import Flask, request, jsonify, send_file, render_template, session, redirect, url_for, Response
 from pdf2image import convert_from_path
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
+from reportlab.graphics.barcode.qr import QrCodeWidget
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics import renderPDF
 import pytesseract
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -19,6 +22,8 @@ jobs = {}
 jobs_lock = threading.Lock()
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'M4Mart2026')
 DATABASE_URL = os.environ.get('DATABASE_URL')
+WEBSITE_URL = 'pillowfactory.co.uk'
+QR_URL = 'https://' + WEBSITE_URL
 
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
@@ -505,6 +510,17 @@ def extract_items_from_pdf(pdf_path):
 
 # ── OVERLAY FUNCTIONS ─────────────────────────────────────────────────────────
 
+def draw_qr_code(c, data, x, y, size):
+    """Draw a QR code on the canvas, bottom-left corner at (x, y), size x size points."""
+    qr = QrCodeWidget(data)
+    b = qr.getBounds()
+    w = b[2] - b[0]
+    h = b[3] - b[1]
+    d = Drawing(size, size, transform=[size / w, 0, 0, size / h, 0, 0])
+    d.add(qr)
+    renderPDF.draw(d, c, x, y)
+
+
 def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w, page_h, warn=False):
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
@@ -536,6 +552,11 @@ def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w
 
     c.setFont('Helvetica-Bold', 7)
     c.drawString(8, 8, str(page_num) + '/' + str(total_pages) + batch_id)
+    c.setFont('Helvetica', 6)
+    c.setFillColorRGB(0.4, 0.4, 0.4)
+    c.drawString(8, 17, WEBSITE_URL)
+    c.setFillColorRGB(0, 0, 0)
+    draw_qr_code(c, QR_URL, page_w - 58, 8, 50)
 
     if warn:
         c.setFillColorRGB(1, 0.4, 0)
@@ -581,6 +602,11 @@ def create_royal_mail_overlay(items, order_id, page_num, total_pages, batch_id, 
     c.setFont('Helvetica-Bold', 7)
     c.setFillColorRGB(0, 0, 0)
     c.drawString(8, 8, str(page_num) + '/' + str(total_pages) + batch_id)
+    c.setFont('Helvetica', 6)
+    c.setFillColorRGB(0.4, 0.4, 0.4)
+    c.drawString(8, 17, WEBSITE_URL)
+    c.setFillColorRGB(0, 0, 0)
+    draw_qr_code(c, QR_URL, page_w - 58, 8, 50)
 
     if warn:
         c.setFillColorRGB(1, 0.4, 0)
@@ -970,6 +996,34 @@ def render_group_html(g_idx, canonical, variants):
 
 
 
+@app.route('/admin/export-weights.csv')
+@admin_required
+def export_weights_csv():
+    """One-off export of the orphaned sku_weights table (kept from before the
+    weight-validation system was removed; data was never deleted)."""
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT sku, typical_weight, count, updated_at FROM sku_weights ORDER BY sku')
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['sku', 'typical_weight', 'count', 'updated_at'])
+    for r in rows:
+        writer.writerow([r['sku'], r['typical_weight'], r['count'], r['updated_at']])
+
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=sku_weights_export.csv'}
+    )
+
+
 @app.route('/admin')
 @admin_required
 def admin():
@@ -1069,6 +1123,7 @@ def admin():
       <div class="nav">
         <h1>⚙️ Admin</h1>
         <a href="/" class="btn">← Back to App</a>
+        <a href="/admin/export-weights.csv" class="btn" style="background:#166534">⬇ Export legacy SKU weights (CSV)</a>
         <a href="/admin/logout" class="btn" style="background:#666">Logout</a>
       </div>
       <div id="msg" class="msg"></div>
