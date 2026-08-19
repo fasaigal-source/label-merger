@@ -8,9 +8,6 @@ from flask import Flask, request, jsonify, send_file, render_template, session, 
 from pdf2image import convert_from_path
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
-from reportlab.graphics.barcode.qr import QrCodeWidget
-from reportlab.graphics.shapes import Drawing
-from reportlab.graphics import renderPDF
 import pytesseract
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -23,7 +20,6 @@ jobs_lock = threading.Lock()
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'M4Mart2026')
 DATABASE_URL = os.environ.get('DATABASE_URL')
 WEBSITE_URL = 'pillowfactory.co.uk'
-QR_URL = 'https://' + WEBSITE_URL
 
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
@@ -510,17 +506,6 @@ def extract_items_from_pdf(pdf_path):
 
 # ── OVERLAY FUNCTIONS ─────────────────────────────────────────────────────────
 
-def draw_qr_code(c, data, x, y, size):
-    """Draw a QR code on the canvas, bottom-left corner at (x, y), size x size points."""
-    qr = QrCodeWidget(data)
-    b = qr.getBounds()
-    w = b[2] - b[0]
-    h = b[3] - b[1]
-    d = Drawing(size, size, transform=[size / w, 0, 0, size / h, 0, 0])
-    d.add(qr)
-    renderPDF.draw(d, c, x, y)
-
-
 def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w, page_h, warn=False):
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
@@ -551,12 +536,13 @@ def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w
         c.drawString(page_w * 0.62, 82, order_id)
 
     c.setFont('Helvetica-Bold', 7)
-    c.drawString(8, 8, str(page_num) + '/' + str(total_pages) + batch_id)
+    batch_text = str(page_num) + '/' + str(total_pages) + batch_id
+    c.drawString(8, 8, batch_text)
+    batch_w = c.stringWidth(batch_text, 'Helvetica-Bold', 7)
     c.setFont('Helvetica', 6)
     c.setFillColorRGB(0.4, 0.4, 0.4)
-    c.drawString(8, 17, WEBSITE_URL)
+    c.drawString(8 + batch_w + 6, 8, WEBSITE_URL)
     c.setFillColorRGB(0, 0, 0)
-    draw_qr_code(c, QR_URL, page_w - 58, 8, 50)
 
     if warn:
         c.setFillColorRGB(1, 0.4, 0)
@@ -601,12 +587,13 @@ def create_royal_mail_overlay(items, order_id, page_num, total_pages, batch_id, 
 
     c.setFont('Helvetica-Bold', 7)
     c.setFillColorRGB(0, 0, 0)
-    c.drawString(8, 8, str(page_num) + '/' + str(total_pages) + batch_id)
+    batch_text = str(page_num) + '/' + str(total_pages) + batch_id
+    c.drawString(8, 8, batch_text)
+    batch_w = c.stringWidth(batch_text, 'Helvetica-Bold', 7)
     c.setFont('Helvetica', 6)
     c.setFillColorRGB(0.4, 0.4, 0.4)
-    c.drawString(8, 17, WEBSITE_URL)
+    c.drawString(8 + batch_w + 6, 8, WEBSITE_URL)
     c.setFillColorRGB(0, 0, 0)
-    draw_qr_code(c, QR_URL, page_w - 58, 8, 50)
 
     if warn:
         c.setFillColorRGB(1, 0.4, 0)
