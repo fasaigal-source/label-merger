@@ -6,9 +6,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, send_file, render_template, session, redirect, url_for, Response
 from pdf2image import convert_from_path
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter, PageObject, Transformation
 from reportlab.pdfgen import canvas
 import pytesseract
+import pdfplumber
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -857,6 +858,214 @@ def run_job(job_id, pdf_files, tmpdir):
         jobs[job_id]['pick_list'] = pick_list
 
 
+# ── 3RD-PARTY LABELS ──────────────────────────────────────────────────────────
+# These are pre-made labels (e.g. Amazon Buy-Shipping / marketplace tools) that
+# ALREADY carry SKU + qty printed in a strip below a 4x6 Evri label, on an
+# oversized 4x8 page. Unlike the Amazon flow there is no packing slip to OCR —
+# the SKU/qty is read straight from the label's text layer. We crop the page
+# back to a true 4x6 and move the SKU/qty up into the empty band under the
+# datamatrix so nothing is wasted. Kept fully separate from the Amazon pipeline
+# so the two formats never share coordinates.
+
+# Empty band inside the 3rd-party Evri label, as fractions of a 4x6 page height
+# (measured on real labels: ~top 128–182pt on a 432pt-tall page).
+TP_BAND_TOP_FRAC = 0.701
+TP_BAND_BOT_FRAC = 0.581
+
+
+def extract_thirdparty_items(plumb_page):
+    """Read every SKU + qty row from the strip *below* the 4x6 label region.
+    Returns a list of (sku, qty). Handles multiple line items per label."""
+    label_h = plumb_page.width * 1.5          # 4x6 label occupies the top of the page
+    words = [w for w in plumb_page.extract_words() if w['top'] > label_h + 2]
+    if not words:
+        return []
+    rows = {}
+    for w in words:
+        rows.setdefault(round(w['top'] / 3.0), []).append(w)   # ~3pt row buckets
+    items = []
+    qty_x_gate = plumb_page.width * 0.6       # qty lives in the right column
+    for key in sorted(rows):
+        rw = sorted(rows[key], key=lambda w: w['x0'])
+        texts_lower = [w['text'].strip().lower() for w in rw]
+        if 'sku' in texts_lower and any(t in ('qty', 'quantity') for t in texts_lower):
+            continue                          # header row
+        qty = ''
+        sku_parts = []
+        for w in rw:
+            t = w['text'].strip()
+            if re.fullmatch(r'[0-9]{1,3}', t) and w['x0'] > qty_x_gate:
+                qty = t
+            else:
+                sku_parts.append(t)
+        sku = ' '.join(sku_parts).strip()
+        if sku:
+            items.append((sku, qty or '1'))
+    return items
+
+
+def create_thirdparty_overlay(items, page_w, page_h):
+    """Compact SKU/qty box drawn into the empty band inside the label.
+    No header; one row per SKU; grows downward and auto-shrinks to fit the band."""
+    packet = io.BytesIO()
+    c = canvas.Canvas(packet, pagesize=(page_w, page_h))
+    if not items:
+        c.save(); packet.seek(0); return packet
+
+    FONT = 'Helvetica-Bold'
+    band_top = page_h * TP_BAND_TOP_FRAC
+    band_bot = page_h * TP_BAND_BOT_FRAC
+    band_h = band_top - band_bot
+    bx0 = 8.0
+    width_cap = page_w - 8.0
+    n = max(len(items), 1)
+    pad = 3.0
+    gap = 12.0
+
+    def total_h(fs):
+        return pad + n * (fs + 2.2) + pad
+
+    row_fs = 8.0
+    for fs in (8.0, 7.5, 7.0, 6.5, 6.0, 5.5):
+        row_fs = fs
+        if total_h(fs) <= band_h:
+            break
+    lh = row_fs + 2.2
+    th = min(total_h(row_fs), band_h)
+
+    def cols(fs):
+        msku = max((c.stringWidth(s, FONT, fs) for s, _ in items), default=40)
+        mqty = max((c.stringWidth(str(q), FONT, fs) for _, q in items), default=8)
+        return msku, mqty
+
+    msku, mqty = cols(row_fs)
+    avail = width_cap - bx0 - pad * 2 - gap - mqty
+    while row_fs > 5.0 and msku > avail:
+        row_fs -= 0.5
+        lh = row_fs + 2.2
+        msku, mqty = cols(row_fs)
+        avail = width_cap - bx0 - pad * 2 - gap - mqty
+
+    bw = max(min(pad + msku + gap + mqty + pad, width_cap - bx0), 110)
+    bx1 = bx0 + bw
+    by1 = band_top
+    by0 = by1 - th
+
+    c.setLineWidth(0.8)
+    c.setFillColorRGB(0.94, 0.94, 0.94)
+    c.rect(bx0, by0, bw, th, stroke=1, fill=1)
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont(FONT, row_fs)
+    ry = by1 - pad - row_fs
+    for s, q in items:
+        c.drawString(bx0 + pad, ry, s)
+        c.drawRightString(bx1 - pad, ry, str(q))
+        ry -= lh
+
+    c.save()
+    packet.seek(0)
+    return packet
+
+
+def process_thirdparty(job_id, pdf_files, tmpdir):
+    """Job runner for the 3rd-party tab: one page = one finished label."""
+    def update(progress, message):
+        with jobs_lock:
+            jobs[job_id]['progress'] = progress
+            jobs[job_id]['message'] = message
+
+    update(0, 'Reading 3rd-party labels...')
+
+    # 1. collect every page across all uploaded PDFs + read its SKU/qty,
+    #    then map each raw SKU through the shared alias/canonical system
+    #    (same confirmed-alias table + unmapped queue as the Amazon flow).
+    page_entries = []
+    for path in pdf_files:
+        try:
+            with pdfplumber.open(path) as plumb:
+                for pidx in range(len(plumb.pages)):
+                    try:
+                        raw_items = extract_thirdparty_items(plumb.pages[pidx])
+                    except Exception:
+                        raw_items = []
+                    items = []
+                    for raw_sku, qty in raw_items:
+                        canonical_sku, was_mapped = get_canonical_sku(raw_sku)
+                        it = {'sku': canonical_sku, 'qty': qty}
+                        if was_mapped:
+                            it['raw_sku'] = raw_sku
+                        items.append(it)
+                    page_entries.append({'path': path, 'index': pidx, 'items': items})
+        except Exception as e:
+            page_entries.append({'path': path, 'index': 0, 'items': [], 'error': str(e)})
+
+    total_labels = max(len(page_entries), 1)
+    writer = PdfWriter()
+    results = []
+
+    # 2. crop each page to 4x6 and stamp the SKU/qty into the band
+    for i, ent in enumerate(page_entries):
+        update(10 + int((i / total_labels) * 85),
+               'Formatting ' + str(i + 1) + '/' + str(len(page_entries)))
+        fname = Path(ent['path']).name
+        if ent.get('error'):
+            results.append({'file': fname, 'status': 'error', 'error': ent['error'],
+                            'needs_check': False, 'warn_reason': None})
+            continue
+        try:
+            reader = PdfReader(str(ent['path']))
+            page = reader.pages[ent['index']]
+            pw = float(page.mediabox.width)
+            ph = float(page.mediabox.height)
+            target_h = pw * 1.5                       # true 4x6 height for this width
+            shift = ph - target_h if ph > target_h + 2 else 0.0
+            if shift < 0:
+                shift = 0.0
+                target_h = ph
+
+            new_page = PageObject.create_blank_page(width=pw, height=target_h)
+            new_page.merge_transformed_page(page, Transformation().translate(0, -shift))
+            if ent['items']:
+                overlay_rows = [(it['sku'], it['qty']) for it in ent['items']]
+                ov = create_thirdparty_overlay(overlay_rows, pw, target_h)
+                new_page.merge_page(PdfReader(ov).pages[0])
+            writer.add_page(new_page)
+
+            has_sku = bool(ent['items'])
+            results.append({
+                'file': fname, 'status': 'ok',
+                'items': ent['items'] or [{'sku': '(no SKU on label)', 'qty': '?'}],
+                'order_id': '', 'page': i + 1, 'batch': '',
+                'carrier': 'Evri · 3rd-party',
+                'needs_check': not has_sku,
+                'warn_reason': None if has_sku else 'no SKU found on label'
+            })
+        except Exception as e:
+            results.append({'file': fname, 'status': 'error', 'error': str(e),
+                            'needs_check': False, 'warn_reason': None})
+
+    update(95, 'Saving PDF...')
+    out_path = os.path.join(tmpdir, 'labels_4x6_' + job_id + '.pdf')
+    with open(out_path, 'wb') as f:
+        writer.write(f)
+
+    ok_count = len([r for r in results if r['status'] == 'ok'])
+    warn_count = len([r for r in results if r.get('needs_check')])
+
+    with jobs_lock:
+        jobs[job_id]['status'] = 'done'
+        jobs[job_id]['progress'] = 100
+        msg = str(ok_count) + '/' + str(len(page_entries)) + ' labels resized to 4×6'
+        if warn_count:
+            msg += ' — ⚠ ' + str(warn_count) + ' had no SKU'
+        jobs[job_id]['message'] = msg
+        jobs[job_id]['result_path'] = out_path
+        jobs[job_id]['results'] = results
+        jobs[job_id]['batch_id'] = ''
+        jobs[job_id]['download_name'] = 'labels_4x6.pdf'
+        jobs[job_id]['pick_list'] = []
+
+
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 
 @app.route('/')
@@ -868,6 +1077,8 @@ def upload():
     job_id = str(uuid.uuid4())[:8]
     tmpdir = tempfile.mkdtemp()
     pdf_files = []
+
+    mode = request.form.get('mode', 'amazon')
 
     uploaded = request.files.getlist('files') or request.files.getlist('file')
     if not uploaded:
@@ -894,7 +1105,8 @@ def upload():
             'message': 'Starting — ' + str(len(pdf_files)) + ' PDF(s) found...',
             'result_path': None, 'results': [], 'batch_id': '', 'download_name': 'merged_labels.pdf'
         }
-    t = threading.Thread(target=run_job, args=(job_id, pdf_files, tmpdir))
+    target = process_thirdparty if mode == 'thirdparty' else run_job
+    t = threading.Thread(target=target, args=(job_id, pdf_files, tmpdir))
     t.daemon = True
     t.start()
     return jsonify({'job_id': job_id, 'total': len(pdf_files)})
