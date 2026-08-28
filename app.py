@@ -854,7 +854,8 @@ def run_job(job_id, pdf_files, tmpdir):
         jobs[job_id]['result_path'] = out_path
         jobs[job_id]['results'] = results
         jobs[job_id]['batch_id'] = batch_id
-        jobs[job_id]['download_name'] = 'labels_batch' + batch_id + '.pdf'
+        ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
+        jobs[job_id]['download_name'] = 'labels_batch' + batch_id + '_' + ts + '.pdf'
         jobs[job_id]['pick_list'] = pick_list
 
 
@@ -1062,7 +1063,8 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
         jobs[job_id]['result_path'] = out_path
         jobs[job_id]['results'] = results
         jobs[job_id]['batch_id'] = ''
-        jobs[job_id]['download_name'] = 'labels_4x6.pdf'
+        ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
+        jobs[job_id]['download_name'] = 'labels_4x6_' + ts + '.pdf'
         jobs[job_id]['pick_list'] = []
 
 
