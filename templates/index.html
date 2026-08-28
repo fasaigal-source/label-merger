@@ -42,6 +42,9 @@
   .drop-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
   .drop-sub { font-size: 13px; color: var(--muted); }
   .drop-hint { font-size: 11px; color: var(--muted); margin-top: 8px; opacity: 0.7; }
+  .modebar { display: flex; gap: 6px; margin-bottom: 1rem; }
+  .modebtn { flex: 1; padding: 10px 12px; font-size: 13px; font-weight: 600; cursor: pointer; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--muted); transition: all 0.15s; }
+  .modebtn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   #file-list { margin-top: 1rem; display: flex; flex-direction: column; gap: 5px; }
   .file-chip { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: var(--blue-bg); border-radius: 7px; font-size: 12px; color: var(--blue); }
   .file-chip span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -101,7 +104,12 @@
 </header>
 <main>
   <h1>Shipping Label + Pick List</h1>
-  <p class="subtitle">Upload a ZIP of order PDFs, or select multiple PDFs directly. SKU & quantity from each packing slip gets stamped onto the Evri label. One PDF out — print and go.</p>
+  <p class="subtitle" id="mode-desc">Amazon order PDFs (label + packing slip). SKU &amp; quantity are OCR-read from each slip and stamped onto the Evri label. One PDF out — print and go.</p>
+
+  <div class="modebar">
+    <button type="button" class="modebtn active" id="mode-amazon" onclick="setMode('amazon')">Amazon Orders</button>
+    <button type="button" class="modebtn" id="mode-thirdparty" onclick="setMode('thirdparty')">3rd-Party Labels</button>
+  </div>
 
   <div class="card">
     <div class="card-title">Upload</div>
@@ -161,6 +169,19 @@
 <script>
 let selectedFiles = [];
 let currentJobId = null;
+let uploadMode = 'amazon';
+
+const MODE_DESC = {
+  amazon: 'Amazon order PDFs (label + packing slip). SKU & quantity are OCR-read from each slip and stamped onto the Evri label. One PDF out — print and go.',
+  thirdparty: '3rd-party labels that already have SKU & quantity printed on them. Each 4×8 label is resized to 4×6 and its SKU/qty is moved up into the empty space inside the label.'
+};
+
+function setMode(m) {
+  uploadMode = m;
+  document.getElementById('mode-amazon').classList.toggle('active', m === 'amazon');
+  document.getElementById('mode-thirdparty').classList.toggle('active', m === 'thirdparty');
+  document.getElementById('mode-desc').textContent = MODE_DESC[m];
+}
 let pollInterval = null;
 
 function ev(e) { e.preventDefault(); }
@@ -206,6 +227,7 @@ async function startProcessing() {
   document.getElementById('results-section').style.display = 'none';
 
   const form = new FormData();
+  form.append('mode', uploadMode);
   // If single ZIP, send as-is. If PDFs, send all.
   for (let f of selectedFiles) form.append('files', f);
 
