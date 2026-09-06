@@ -11,7 +11,7 @@ from reportlab.pdfgen import canvas
 import pytesseract
 import pdfplumber
 import psycopg2
-from postcode_checker import check_label_postcode
+from postcode_checker import check_label_postcode, render_pdf_pages
 from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
@@ -988,6 +988,10 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
     for path in pdf_files:
         try:
             with pdfplumber.open(path) as plumb:
+                # The Destination box on these labels is part of a flattened
+                # image (no text layer) — render once per file so the postcode
+                # check below can OCR just the address crop of each page.
+                page_images = render_pdf_pages(path)
                 for pidx in range(len(plumb.pages)):
                     plumb_page = plumb.pages[pidx]
                     try:
@@ -1005,9 +1009,10 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
                         page_text = plumb_page.extract_text() or ''
                     except Exception:
                         page_text = ''
+                    page_img = page_images[pidx] if pidx < len(page_images) else None
                     page_entries.append({
                         'path': path, 'index': pidx, 'items': items,
-                        'postcode': check_label_postcode(page_text),
+                        'postcode': check_label_postcode(page_text, page_img),
                         'sort_key': items[0]['sku'].upper() if items else 'ZZZZ'
                     })
         except Exception as e:
@@ -1100,7 +1105,7 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
             'needs_check': True,
             'postcode': pc['postcode'],
             'postcode_flagged': pc['flagged'],
-            'warn_reason': pc['reason'] if pc['flagged'] else 'No postcode could be read — check manually'
+            'warn_reason': pc['reason']
         })
 
     for ent in error_entries:
