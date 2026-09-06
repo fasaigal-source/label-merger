@@ -285,11 +285,17 @@ function showResults(data) {
       ? `<span class="mapped-note">mapped from ${mappedItems.map(i => i.raw_sku).join(', ')}</span>`
       : '';
     const isWarn = r.needs_check;
-    const badge = r.status === 'ok'
-      ? (isWarn ? `<span class="badge warn">⚠ CHECK QTY</span>` : `<span class="badge ok">✓ ${r.items ? r.items.length : 0} SKU${r.items && r.items.length !== 1 ? 's' : ''}</span>`)
-      : `<span class="badge err">Error</span>`;
+    let badge;
+    if (r.status === 'ok') {
+      badge = isWarn ? `<span class="badge warn">⚠ CHECK QTY</span>` : `<span class="badge ok">✓ ${r.items ? r.items.length : 0} SKU${r.items && r.items.length !== 1 ? 's' : ''}</span>`;
+    } else if (r.status === 'excluded') {
+      badge = r.postcode_flagged ? `<span class="badge err">🚫 OUT OF AREA</span>` : `<span class="badge warn">⚠ CHECK POSTCODE</span>`;
+    } else {
+      badge = `<span class="badge err">Error</span>`;
+    }
+    const postcodeNote = r.postcode ? `<span class="mapped-note">postcode: ${r.postcode}</span>` : '';
     const warnRow = isWarn && r.warn_reason ? `<span class="warn-reason">⚠ ${r.warn_reason}</span>` : '';
-    return `<div class="result-row${isWarn ? ' warn' : ''}">${badge}<span class="fname">${r.file}</span><span class="skus">${skuText}</span>${mappedNote}${warnRow}</div>`;
+    return `<div class="result-row${isWarn ? ' warn' : ''}">${badge}<span class="fname">${r.file}</span><span class="skus">${skuText}</span>${mappedNote}${postcodeNote}${warnRow}</div>`;
   }).join('');
   document.getElementById('results-section').style.display = 'block';
   if (ok > 0) {
