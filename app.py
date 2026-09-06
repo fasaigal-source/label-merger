@@ -11,6 +11,7 @@ from reportlab.pdfgen import canvas
 import pytesseract
 import pdfplumber
 import psycopg2
+from postcode_checker import check_label_postcode
 from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
@@ -976,17 +977,21 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
             jobs[job_id]['message'] = message
 
     update(0, 'Reading 3rd-party labels...')
+    run_label = datetime.now(ZoneInfo('Europe/London')).strftime('%H%M')
 
     # 1. collect every page across all uploaded PDFs + read its SKU/qty,
     #    then map each raw SKU through the shared alias/canonical system
     #    (same confirmed-alias table + unmapped queue as the Amazon flow).
+    #    Also read the postcode off the label so Highlands/Islands/Channel
+    #    Islands (out-of-area) orders can be pulled before they're merged.
     page_entries = []
     for path in pdf_files:
         try:
             with pdfplumber.open(path) as plumb:
                 for pidx in range(len(plumb.pages)):
+                    plumb_page = plumb.pages[pidx]
                     try:
-                        raw_items = extract_thirdparty_items(plumb.pages[pidx])
+                        raw_items = extract_thirdparty_items(plumb_page)
                     except Exception:
                         raw_items = []
                     items = []
@@ -996,23 +1001,60 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
                         if was_mapped:
                             it['raw_sku'] = raw_sku
                         items.append(it)
-                    page_entries.append({'path': path, 'index': pidx, 'items': items})
+                    try:
+                        page_text = plumb_page.extract_text() or ''
+                    except Exception:
+                        page_text = ''
+                    page_entries.append({
+                        'path': path, 'index': pidx, 'items': items,
+                        'postcode': check_label_postcode(page_text),
+                        'sort_key': items[0]['sku'].upper() if items else 'ZZZZ'
+                    })
         except Exception as e:
-            page_entries.append({'path': path, 'index': 0, 'items': [], 'error': str(e)})
+            page_entries.append({'path': path, 'index': 0, 'items': [], 'error': str(e),
+                                  'postcode': None, 'sort_key': 'ZZZZ'})
 
+    # 2. split off anything that failed to open, is confirmed out-of-area, or
+    #    has no readable postcode — none of these should reach the merged PDF.
+    error_entries = [e for e in page_entries if e.get('error')]
+    excluded_entries = [e for e in page_entries if not e.get('error') and e['postcode']['exclude']]
+    included_entries = [e for e in page_entries if not e.get('error') and not e['postcode']['exclude']]
     total_labels = max(len(page_entries), 1)
+
+    update(35, 'Sorting by SKU...')
+    included_entries.sort(key=lambda e: e['sort_key'])
+
+    pick_list = build_pick_list(included_entries)
+
     writer = PdfWriter()
+
+    # peek the first included label's real dimensions for the pick-list page
+    label_w, label_h = 288, 432
+    if included_entries:
+        try:
+            peek_reader = PdfReader(str(included_entries[0]['path']))
+            peek_page = peek_reader.pages[included_entries[0]['index']]
+            pw0 = float(peek_page.mediabox.width)
+            ph0 = float(peek_page.mediabox.height)
+            target_h0 = pw0 * 1.5
+            if ph0 <= target_h0 + 2:
+                target_h0 = ph0
+            label_w, label_h = pw0, target_h0
+        except Exception:
+            pass
+
+    if pick_list:
+        pick_list_buf = create_pick_list_page(pick_list, run_label, len(included_entries), label_w, label_h)
+        for pg in PdfReader(pick_list_buf).pages:
+            writer.add_page(pg)
+
     results = []
 
-    # 2. crop each page to 4x6 and stamp the SKU/qty into the band
-    for i, ent in enumerate(page_entries):
-        update(10 + int((i / total_labels) * 85),
-               'Formatting ' + str(i + 1) + '/' + str(len(page_entries)))
+    # 3. crop + stamp only the included labels, now in SKU order
+    for i, ent in enumerate(included_entries):
+        update(40 + int((i / max(len(included_entries), 1)) * 55),
+               'Formatting ' + str(i + 1) + '/' + str(len(included_entries)))
         fname = Path(ent['path']).name
-        if ent.get('error'):
-            results.append({'file': fname, 'status': 'error', 'error': ent['error'],
-                            'needs_check': False, 'warn_reason': None})
-            continue
         try:
             reader = PdfReader(str(ent['path']))
             page = reader.pages[ent['index']]
@@ -1036,7 +1078,7 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
             results.append({
                 'file': fname, 'status': 'ok',
                 'items': ent['items'] or [{'sku': '(no SKU on label)', 'qty': '?'}],
-                'order_id': '', 'page': i + 1, 'batch': '',
+                'order_id': '', 'page': i + 1, 'batch': run_label,
                 'carrier': 'Evri · 3rd-party',
                 'needs_check': not has_sku,
                 'warn_reason': None if has_sku else 'no SKU found on label'
@@ -1045,27 +1087,54 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
             results.append({'file': fname, 'status': 'error', 'error': str(e),
                             'needs_check': False, 'warn_reason': None})
 
+    # 4. flagged/unreadable-postcode labels never enter the merge — surfaced
+    #    here instead so they can be found and cancelled on Amazon.
+    for ent in excluded_entries:
+        fname = Path(ent['path']).name
+        pc = ent['postcode']
+        results.append({
+            'file': fname, 'status': 'excluded',
+            'items': ent['items'] or [{'sku': '(no SKU on label)', 'qty': '?'}],
+            'order_id': '', 'page': None, 'batch': '',
+            'carrier': 'Evri · 3rd-party',
+            'needs_check': True,
+            'postcode': pc['postcode'],
+            'postcode_flagged': pc['flagged'],
+            'warn_reason': pc['reason'] if pc['flagged'] else 'No postcode could be read — check manually'
+        })
+
+    for ent in error_entries:
+        fname = Path(ent['path']).name
+        results.append({'file': fname, 'status': 'error', 'error': ent['error'],
+                        'needs_check': False, 'warn_reason': None})
+
     update(95, 'Saving PDF...')
     out_path = os.path.join(tmpdir, 'labels_4x6_' + job_id + '.pdf')
     with open(out_path, 'wb') as f:
         writer.write(f)
 
     ok_count = len([r for r in results if r['status'] == 'ok'])
-    warn_count = len([r for r in results if r.get('needs_check')])
+    warn_count = len([r for r in results if r['status'] == 'ok' and r.get('needs_check')])
+    out_of_area_count = len([r for r in results if r['status'] == 'excluded' and r.get('postcode_flagged')])
+    check_pc_count = len([r for r in results if r['status'] == 'excluded' and not r.get('postcode_flagged')])
 
     with jobs_lock:
         jobs[job_id]['status'] = 'done'
         jobs[job_id]['progress'] = 100
-        msg = str(ok_count) + '/' + str(len(page_entries)) + ' labels resized to 4×6'
+        msg = str(ok_count) + '/' + str(total_labels) + ' labels resized to 4×6'
         if warn_count:
             msg += ' — ⚠ ' + str(warn_count) + ' had no SKU'
+        if out_of_area_count:
+            msg += ' — 🚫 ' + str(out_of_area_count) + ' out of area'
+        if check_pc_count:
+            msg += ' — ⚠ ' + str(check_pc_count) + ' need postcode check'
         jobs[job_id]['message'] = msg
         jobs[job_id]['result_path'] = out_path
         jobs[job_id]['results'] = results
-        jobs[job_id]['batch_id'] = ''
+        jobs[job_id]['batch_id'] = run_label
         ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
         jobs[job_id]['download_name'] = 'labels_4x6_' + ts + '.pdf'
-        jobs[job_id]['pick_list'] = []
+        jobs[job_id]['pick_list'] = pick_list
 
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
