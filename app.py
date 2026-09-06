@@ -1086,6 +1086,7 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
                 'order_id': '', 'page': i + 1, 'batch': run_label,
                 'carrier': 'Evri · 3rd-party',
                 'needs_check': not has_sku,
+                'postcode': ent['postcode']['postcode'],
                 'warn_reason': None if has_sku else 'no SKU found on label'
             })
         except Exception as e:

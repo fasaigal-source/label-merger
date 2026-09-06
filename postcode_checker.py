@@ -118,13 +118,23 @@ def extract_postcode_from_text(text: str):
     return f"{m.group(1)} {m.group(2)}".upper()
 
 
+def _looks_like_postcode_shaped(line):
+    """Loose shape check: two tokens, first 2-4 chars, second exactly 3 —
+    matches a postcode's word pattern even if the characters are wrong."""
+    parts = line.split()
+    return len(parts) == 2 and 2 <= len(parts[0]) <= 4 and len(parts[1]) == 3
+
+
 def extract_postcode_via_ocr(page_image):
     """OCR just the Destination box of a rendered 3rd-party label page
     (a PIL Image, e.g. from pdf2image.convert_from_path). Tries a strict
-    read first, then a second pass correcting common OCR confusions before
-    giving up."""
+    read first, then a second pass correcting common OCR confusions.
+    Returns (postcode, ocr_guess): postcode is the confirmed match (or None),
+    and ocr_guess is the OCR'd line most likely to be the postcode when
+    nothing parsed cleanly — handed back so it can be shown to the user for
+    a quick manual read, without them needing to reopen the original file."""
     if page_image is None:
-        return None
+        return None, None
     w, h = page_image.size
     box = (
         int(ADDR_LEFT_FRAC * w), int(ADDR_TOP_FRAC * h),
@@ -135,15 +145,28 @@ def extract_postcode_via_ocr(page_image):
 
     m = STRICT_POSTCODE_RE.search(text)
     if m:
-        return f"{m.group(1)} {m.group(2)}"
+        return f"{m.group(1)} {m.group(2)}", None
 
     m2 = LOOSE_POSTCODE_RE.search(text)
     if m2:
         outward, inward = _normalize_loose_match(m2.group(1), m2.group(2))
         candidate = f"{outward} {inward}"
         if STRICT_POSTCODE_RE.match(candidate):
-            return candidate
-    return None
+            return candidate, None
+
+    # Nothing parsed cleanly. Pick the best guess: scan from the bottom (the
+    # postcode is always the last line of a UK address) for a line that at
+    # least has the right two-token/3-char shape, so we don't hand back
+    # unrelated noise from below the address box as the "guess".
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    ocr_guess = None
+    for l in reversed(lines):
+        if _looks_like_postcode_shaped(l):
+            ocr_guess = l
+            break
+    if ocr_guess is None and lines:
+        ocr_guess = lines[-1]
+    return None, ocr_guess
 
 
 def is_out_of_area(postcode: str):
@@ -188,19 +211,25 @@ def check_label_postcode(text: str = None, page_image=None):
         "warning": bool,     # postcode couldn't be read at all
         "exclude": bool,     # True if flagged OR warning -> pull from merge
         "reason": str | None,
+        "ocr_guess": str | None,  # best-effort OCR line when nothing parsed
       }
     """
     postcode = extract_postcode_from_text(text)
+    ocr_guess = None
     if postcode is None and page_image is not None:
-        postcode = extract_postcode_via_ocr(page_image)
+        postcode, ocr_guess = extract_postcode_via_ocr(page_image)
 
     if postcode is None:
+        reason = "No postcode could be read — check manually"
+        if ocr_guess:
+            reason += f' (OCR saw: "{ocr_guess}")'
         return {
             "postcode": None,
             "flagged": False,
             "warning": True,
             "exclude": True,
-            "reason": "No postcode could be read — check manually",
+            "reason": reason,
+            "ocr_guess": ocr_guess,
         }
 
     flagged, reason = is_out_of_area(postcode)
@@ -210,6 +239,7 @@ def check_label_postcode(text: str = None, page_image=None):
         "warning": False,
         "exclude": flagged,
         "reason": reason,
+        "ocr_guess": None,
     }
 
 
