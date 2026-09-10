@@ -2,7 +2,7 @@
 import os, re, io, csv, json, zipfile, tempfile, threading, uuid, string, html as html_module
 from pathlib import Path
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, send_file, render_template, session, redirect, url_for, Response
 from pdf2image import convert_from_path
@@ -68,6 +68,33 @@ def init_db():
                 dismissed BOOLEAN NOT NULL DEFAULT FALSE
             )
         ''')
+        # Merged label PDFs, stored in the DB (not the filesystem) so they
+        # survive Railway restarts/redeploys. Kept for 2 days on a rolling
+        # basis — see cleanup_old_label_files(), called on every /upload.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS label_files (
+                job_id TEXT PRIMARY KEY,
+                tab TEXT NOT NULL,
+                batch_id TEXT,
+                filename TEXT NOT NULL,
+                file_data BYTEA NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        ''')
+        # Every pick-list line (SKU + qty) ever generated, one row per SKU
+        # per batch, kept indefinitely (NOT subject to the 2-day cleanup —
+        # this is what /admin/pick-list-totals sums over for weekly totals).
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS pick_list_entries (
+                id SERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                tab TEXT NOT NULL,
+                batch_id TEXT,
+                sku TEXT NOT NULL,
+                qty INTEGER NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        ''')
         conn.commit()
         cur.close()
         conn.close()
@@ -97,6 +124,67 @@ def get_next_batch_id():
     except Exception as e:
         print(f"Batch counter error: {e}")
         return 'A'
+
+
+# ── LABEL FILE STORAGE (2-day rolling retention) + PICK LIST HISTORY ────────
+
+def cleanup_old_label_files():
+    """Delete label PDFs older than 2 days. Called opportunistically on every
+    /upload rather than via a separate scheduled worker — Railway has no
+    lightweight built-in cron for this app, and an upload-triggered sweep
+    keeps the table pruned without adding a second process to run/monitor."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM label_files WHERE created_at < NOW() - INTERVAL '2 days'")
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Label file cleanup error: {e}")
+
+
+def save_label_file(job_id, tab, batch_id, filename, file_bytes):
+    """Store a finished merged-labels PDF in the DB, keyed by job_id, so
+    /download/<job_id> keeps working for 2 days even across app restarts.
+    batch_id is stored alongside so the front-end history list can show it."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO label_files (job_id, tab, batch_id, filename, file_data)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (job_id) DO UPDATE SET
+                tab = EXCLUDED.tab, batch_id = EXCLUDED.batch_id,
+                filename = EXCLUDED.filename, file_data = EXCLUDED.file_data,
+                created_at = NOW()
+        ''', (job_id, tab, batch_id, filename, psycopg2.Binary(file_bytes)))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Save label file error: {e}")
+
+
+def save_pick_list_entries(job_id, tab, batch_id, pick_list):
+    """Record every SKU/qty line from a generated pick list, permanently
+    (not subject to the 2-day label-file cleanup) — this is the running
+    history that /admin/pick-list-totals sums for weekly totals."""
+    if not pick_list:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        for entry in pick_list:
+            cur.execute('''
+                INSERT INTO pick_list_entries (job_id, tab, batch_id, sku, qty)
+                VALUES (%s, %s, %s, %s, %s)
+            ''', (job_id, tab, batch_id, entry['sku'], entry['qty']))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Save pick list history error: {e}")
 
 
 # ── SKU ALIAS / CANONICAL MAPPING ────────────────────────────────────────────
@@ -844,6 +932,12 @@ def run_job(job_id, pdf_files, tmpdir):
 
     ok_count = len([r for r in results if r['status'] == 'ok'])
     warn_count = len([r for r in results if r.get('needs_check')])
+    ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
+    download_name = 'labels_batch' + batch_id + '_' + ts + '.pdf'
+
+    with open(out_path, 'rb') as f:
+        save_label_file(job_id, 'amazon', batch_id, download_name, f.read())
+    save_pick_list_entries(job_id, 'amazon', batch_id, pick_list)
 
     with jobs_lock:
         jobs[job_id]['status'] = 'done'
@@ -855,8 +949,7 @@ def run_job(job_id, pdf_files, tmpdir):
         jobs[job_id]['result_path'] = out_path
         jobs[job_id]['results'] = results
         jobs[job_id]['batch_id'] = batch_id
-        ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
-        jobs[job_id]['download_name'] = 'labels_batch' + batch_id + '_' + ts + '.pdf'
+        jobs[job_id]['download_name'] = download_name
         jobs[job_id]['pick_list'] = pick_list
 
 
@@ -1123,6 +1216,12 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
     warn_count = len([r for r in results if r['status'] == 'ok' and r.get('needs_check')])
     out_of_area_count = len([r for r in results if r['status'] == 'excluded' and r.get('postcode_flagged')])
     check_pc_count = len([r for r in results if r['status'] == 'excluded' and not r.get('postcode_flagged')])
+    ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
+    download_name = 'labels_4x6_' + ts + '.pdf'
+
+    with open(out_path, 'rb') as f:
+        save_label_file(job_id, 'thirdparty', run_label, download_name, f.read())
+    save_pick_list_entries(job_id, 'thirdparty', run_label, pick_list)
 
     with jobs_lock:
         jobs[job_id]['status'] = 'done'
@@ -1138,8 +1237,7 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
         jobs[job_id]['result_path'] = out_path
         jobs[job_id]['results'] = results
         jobs[job_id]['batch_id'] = run_label
-        ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
-        jobs[job_id]['download_name'] = 'labels_4x6_' + ts + '.pdf'
+        jobs[job_id]['download_name'] = download_name
         jobs[job_id]['pick_list'] = pick_list
 
 
@@ -1151,6 +1249,7 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload():
+    cleanup_old_label_files()
     job_id = str(uuid.uuid4())[:8]
     tmpdir = tempfile.mkdtemp()
     pdf_files = []
@@ -1198,13 +1297,50 @@ def status(job_id):
 
 @app.route('/download/<job_id>')
 def download(job_id):
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if not job or not job.get('result_path'):
-        return jsonify({'error': 'Not ready'}), 404
-    return send_file(job['result_path'], as_attachment=True,
-                     download_name=job.get('download_name', 'merged_labels.pdf'),
-                     mimetype='application/pdf')
+    # Served from the DB, not the (ephemeral) filesystem or the in-memory
+    # jobs dict, so downloads keep working for 2 days even across app
+    # restarts/redeploys — see label_files / cleanup_old_label_files().
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT filename, file_data FROM label_files WHERE job_id = %s', (job_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    if not row:
+        return jsonify({'error': 'Not ready, or this file has expired (labels are kept for 2 days)'}), 404
+    filename, file_data = row
+    return send_file(io.BytesIO(bytes(file_data)), as_attachment=True,
+                     download_name=filename, mimetype='application/pdf')
+
+@app.route('/label-history')
+def label_history():
+    """Every currently-retained label file (2-day rolling window, oldest
+    already swept out by cleanup_old_label_files), most recent first — this
+    is what the front-page "Recent Label Files" list reads from."""
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('''
+            SELECT job_id, tab, batch_id, filename, created_at
+            FROM label_files
+            ORDER BY created_at DESC
+            LIMIT 100
+        ''')
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify([{
+        'job_id': r['job_id'],
+        'tab': r['tab'],
+        'batch_id': r['batch_id'],
+        'filename': r['filename'],
+        'created_at': r['created_at'].isoformat() if r['created_at'] else None,
+    } for r in rows])
 
 
 # ── ADMIN ROUTES ──────────────────────────────────────────────────────────────
@@ -1297,6 +1433,133 @@ def export_weights_csv():
         output.getvalue(),
         mimetype='text/csv',
         headers={'Content-Disposition': 'attachment; filename=sku_weights_export.csv'}
+    )
+
+
+def _week_bounds(week_str):
+    """Parse 'YYYY-Www' (ISO week) into (monday_midnight, next_monday_midnight)
+    in Europe/London. Falls back to the current week if missing/invalid."""
+    tz = ZoneInfo('Europe/London')
+    try:
+        year_str, w_str = week_str.split('-W')
+        monday = datetime.fromisocalendar(int(year_str), int(w_str), 1).replace(tzinfo=tz)
+    except Exception:
+        now = datetime.now(tz)
+        iso = now.isocalendar()
+        monday = datetime.fromisocalendar(iso[0], iso[1], 1).replace(tzinfo=tz)
+    return monday, monday + timedelta(days=7)
+
+
+def _pick_list_totals_query(monday, next_monday, tab_filter):
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    query = '''
+        SELECT sku, SUM(qty) AS total_qty, COUNT(DISTINCT job_id) AS batches
+        FROM pick_list_entries
+        WHERE created_at >= %s AND created_at < %s
+    '''
+    params = [monday, next_monday]
+    if tab_filter in ('amazon', 'thirdparty'):
+        query += ' AND tab = %s'
+        params.append(tab_filter)
+    query += ' GROUP BY sku ORDER BY total_qty DESC'
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+@app.route('/admin/pick-list-totals')
+@admin_required
+def pick_list_totals():
+    """Weekly totals across every pick list ever generated (Amazon Orders +
+    3rd-Party tabs), so you can see how many of each SKU actually went out
+    in a given week. Data comes from pick_list_entries, which is written
+    every time a batch finishes and is never auto-deleted."""
+    week_str = request.args.get('week', '')
+    tab_filter = request.args.get('tab', 'all')
+    monday, next_monday = _week_bounds(week_str)
+    current_week_str = f'{monday.isocalendar()[0]}-W{monday.isocalendar()[1]:02d}'
+    prev_monday = monday - timedelta(days=7)
+    next_monday_nav = monday + timedelta(days=7)
+    prev_week_str = f'{prev_monday.isocalendar()[0]}-W{prev_monday.isocalendar()[1]:02d}'
+    next_week_str = f'{next_monday_nav.isocalendar()[0]}-W{next_monday_nav.isocalendar()[1]:02d}'
+
+    try:
+        rows = _pick_list_totals_query(monday, next_monday, tab_filter)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    total_units = sum(r['total_qty'] for r in rows)
+    rows_html = ''.join(
+        f'<tr><td>{esc_html(r["sku"])}</td><td>{r["total_qty"]}</td><td>{r["batches"]}</td></tr>'
+        for r in rows
+    )
+    week_label = f"{monday.strftime('%d %b %Y')} \u2013 {(next_monday - timedelta(days=1)).strftime('%d %b %Y')}"
+
+    def tab_link(t, label):
+        style = ' style="font-weight:bold;text-decoration:underline;"' if tab_filter == t else ''
+        return f'<a href="/admin/pick-list-totals?week={current_week_str}&tab={t}"{style}>{label}</a>'
+
+    return f'''<!DOCTYPE html>
+    <html><head><title>Pick List Totals</title>
+    <style>
+      body {{ font-family: sans-serif; background: #f5f4f0; margin: 0; padding: 2rem; }}
+      h1 {{ font-size: 1.4rem; margin-bottom: 0.5rem; }}
+      .sub {{ color: #666; font-size: 13px; margin-bottom: 1.5rem; }}
+      table {{ border-collapse: collapse; width: 100%; max-width: 640px; background: #fff; }}
+      th, td {{ text-align: left; padding: 8px 12px; border-bottom: 1px solid #e5e3de; font-size: 14px; }}
+      th {{ background: #efece5; }}
+      .nav a, .tabs a {{ margin-right: 16px; color: #2563eb; text-decoration: none; }}
+      .nav a:hover, .tabs a:hover {{ text-decoration: underline; }}
+      .total-row td {{ font-weight: bold; border-top: 2px solid #333; }}
+    </style></head>
+    <body>
+      <h1>Pick List Totals \u2014 week of {week_label}</h1>
+      <div class="sub">{total_units} total units across {len(rows)} SKUs this week</div>
+      <div class="nav">
+        <a href="/admin/pick-list-totals?week={prev_week_str}&tab={tab_filter}">&larr; Previous week</a>
+        <a href="/admin/pick-list-totals?week={current_week_str}&tab={tab_filter}">This week</a>
+        <a href="/admin/pick-list-totals?week={next_week_str}&tab={tab_filter}">Next week &rarr;</a>
+      </div>
+      <div class="tabs" style="margin-bottom:1rem;">
+        {tab_link('all', 'All')} {tab_link('amazon', 'Amazon Orders')} {tab_link('thirdparty', '3rd-Party')}
+        &nbsp;|&nbsp; <a href="/admin/pick-list-totals.csv?week={current_week_str}&tab={tab_filter}">Download CSV</a>
+      </div>
+      <table>
+        <tr><th>SKU</th><th>Total Qty</th><th>Batches</th></tr>
+        {rows_html}
+        <tr class="total-row"><td>Total</td><td>{total_units}</td><td>\u2014</td></tr>
+      </table>
+      <p><a href="/admin">&larr; Back to admin</a></p>
+    </body></html>'''
+
+
+@app.route('/admin/pick-list-totals.csv')
+@admin_required
+def pick_list_totals_csv():
+    week_str = request.args.get('week', '')
+    tab_filter = request.args.get('tab', 'all')
+    monday, next_monday = _week_bounds(week_str)
+
+    try:
+        rows = _pick_list_totals_query(monday, next_monday, tab_filter)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['sku', 'total_qty', 'batches'])
+    for r in rows:
+        writer.writerow([r['sku'], r['total_qty'], r['batches']])
+
+    iso = monday.isocalendar()
+    fname = f'pick_list_totals_{iso[0]}-W{iso[1]:02d}.csv'
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename={fname}'}
     )
 
 
