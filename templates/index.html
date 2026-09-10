@@ -91,6 +91,11 @@
   .pick-row .pick-qty { font-weight: 700; color: var(--blue); min-width: 40px; }
   .pick-row .pick-sku { flex: 1; font-weight: 500; }
   .pick-row .pick-total-val { font-weight: 700; color: var(--muted); min-width: 32px; text-align: right; }
+  .history-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; background: var(--card); margin-bottom: 5px; flex-wrap: wrap; }
+  .history-row .hist-title { font-weight: 600; min-width: 130px; }
+  .history-row .hist-time { color: var(--muted); font-size: 12px; }
+  .history-row .hist-dl { margin-left: auto; font-size: 12px; font-weight: 600; color: var(--blue); text-decoration: none; white-space: nowrap; }
+  .history-row .hist-dl:hover { text-decoration: underline; }
   @media (max-width: 500px) { .steps { grid-template-columns: 1fr; } h1 { font-size: 22px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>
 </head>
@@ -131,6 +136,11 @@
     <button id="process-btn" onclick="startProcessing()">
       ▶ Click to start processing
     </button>
+  </div>
+
+  <div class="card" id="history-section">
+    <div class="card-title">Recent Label Files <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);">— kept for 2 days</span></div>
+    <div id="history-list" style="font-size:13px;color:var(--muted);">Loading…</div>
   </div>
 
   <div class="card" id="progress-section">
@@ -305,6 +315,7 @@ function showResults(data) {
   }
   document.getElementById('reset-btn').style.display = 'block';
   document.getElementById('process-btn').style.display = 'none';
+  loadHistory();
 }
 
 function downloadResult() {
@@ -323,6 +334,32 @@ function resetApp() {
   document.getElementById('process-btn').disabled = false;
   document.getElementById('file-input').value = '';
 }
+
+async function loadHistory() {
+  const list = document.getElementById('history-list');
+  try {
+    const res = await fetch('/label-history');
+    const items = await res.json();
+    if (items.error) throw new Error(items.error);
+    if (!items.length) {
+      list.innerHTML = '<div style="font-size:13px;color:var(--muted);">No label files in the last 2 days.</div>';
+      return;
+    }
+    list.innerHTML = items.map(it => {
+      const title = it.tab === 'thirdparty' ? '3rd-Party Labels' : 'Amazon Orders';
+      const time = new Date(it.created_at).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+      return `<div class="history-row">
+        <span class="hist-title">${title}</span>
+        <span class="hist-time">${time}</span>
+        <span class="mapped-note">Batch ${it.batch_id || '—'}</span>
+        <a class="hist-dl" href="/download/${it.job_id}">⬇ Download</a>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    list.innerHTML = '<div style="font-size:13px;color:var(--red);">Couldn\'t load label history.</div>';
+  }
+}
+loadHistory();
 </script>
 </body>
 </html>
