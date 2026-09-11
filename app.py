@@ -82,8 +82,9 @@ def init_db():
             )
         ''')
         # Every pick-list line (SKU + qty) ever generated, one row per SKU
-        # per batch, kept indefinitely (NOT subject to the 2-day cleanup —
-        # this is what /admin/pick-list-totals sums over for weekly totals).
+        # per batch — kept for 3 months on a rolling basis (NOT the 2-day
+        # window used for label_files), swept by cleanup_old_pick_list_entries().
+        # This is what /admin/pick-list-totals sums over for weekly totals.
         cur.execute('''
             CREATE TABLE IF NOT EXISTS pick_list_entries (
                 id SERIAL PRIMARY KEY,
@@ -144,6 +145,23 @@ def cleanup_old_label_files():
         print(f"Label file cleanup error: {e}")
 
 
+def cleanup_old_pick_list_entries():
+    """Delete pick-list history rows older than 3 months, same
+    called-on-every-upload approach as cleanup_old_label_files(). This is a
+    separate, much longer window than label_files — pick-list rows are tiny
+    (~100-150 bytes each) so 3 months of even a busy operation's worth is
+    only a few MB, but a fixed retention was requested over "keep forever"."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM pick_list_entries WHERE created_at < NOW() - INTERVAL '3 months'")
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Pick list history cleanup error: {e}")
+
+
 def save_label_file(job_id, tab, batch_id, filename, file_bytes):
     """Store a finished merged-labels PDF in the DB, keyed by job_id, so
     /download/<job_id> keeps working for 2 days even across app restarts.
@@ -167,9 +185,10 @@ def save_label_file(job_id, tab, batch_id, filename, file_bytes):
 
 
 def save_pick_list_entries(job_id, tab, batch_id, pick_list):
-    """Record every SKU/qty line from a generated pick list, permanently
-    (not subject to the 2-day label-file cleanup) — this is the running
-    history that /admin/pick-list-totals sums for weekly totals."""
+    """Record every SKU/qty line from a generated pick list. Kept for 3
+    months (its own cleanup, separate from the 2-day label-file window —
+    see cleanup_old_pick_list_entries()) — this is the running history
+    that /admin/pick-list-totals sums for weekly totals."""
     if not pick_list:
         return
     try:
@@ -1250,6 +1269,7 @@ def index():
 @app.route('/upload', methods=['POST'])
 def upload():
     cleanup_old_label_files()
+    cleanup_old_pick_list_entries()
     job_id = str(uuid.uuid4())[:8]
     tmpdir = tempfile.mkdtemp()
     pdf_files = []
@@ -1663,6 +1683,7 @@ def admin():
         <h1>⚙️ Admin</h1>
         <a href="/" class="btn">← Back to App</a>
         <a href="/admin/export-weights.csv" class="btn" style="background:#166534">⬇ Export legacy SKU weights (CSV)</a>
+        <a href="/admin/pick-list-totals" class="btn" style="background:#1e40af">📊 Pick List Totals</a>
         <a href="/admin/logout" class="btn" style="background:#666">Logout</a>
       </div>
       <div id="msg" class="msg"></div>
