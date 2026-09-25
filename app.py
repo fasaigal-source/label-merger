@@ -1081,6 +1081,241 @@ def create_thirdparty_overlay(items, page_w, page_h):
     return packet
 
 
+# ── AMAZON EASY SHIP (Evri) ──────────────────────────────────────────────────
+# Full-page A4 labels, completely flattened to one image (confirmed via
+# pdfplumber: 0 real characters anywhere, identical image bounding box across
+# every page of a real 15-label batch) — unlike the 3rd-party tab, there is
+# no text layer to fall back on anywhere, not even for SKU/Qty, so this has
+# to be OCR'd. The SKU/Qty cell position and the blank margin used for the
+# stamp were both mapped from real label text positions (pytesseract
+# image_to_data), not guessed.
+
+ES_SKU_LEFT_FRAC = 0.28
+ES_SKU_TOP_FRAC = 0.803
+ES_SKU_RIGHT_FRAC = 0.97
+ES_SKU_BOT_FRAC = 0.833
+ES_OCR_DPI = 200
+
+# Blank margin to the right of the barcode, below the VAN/DROP/C-ROUND block
+# — the only genuinely open space on this dense template (checked against
+# every text element's real position; nothing else fits without overlap).
+ES_STAMP_X0_FRAC = 0.775
+ES_STAMP_X1_FRAC = 0.965
+ES_STAMP_TOP_FRAC = 0.75    # from top of page
+ES_STAMP_BOT_FRAC = 0.955   # from top of page
+
+
+def extract_easyship_raw_line(page_image):
+    """OCR the SKU/Qty table cell off a rendered Easy Ship label page."""
+    if page_image is None:
+        return ''
+    w, h = page_image.size
+    box = (
+        int(ES_SKU_LEFT_FRAC * w), int(ES_SKU_TOP_FRAC * h),
+        int(ES_SKU_RIGHT_FRAC * w), int(ES_SKU_BOT_FRAC * h),
+    )
+    crop = page_image.crop(box)
+    return pytesseract.image_to_string(crop, config='--psm 7').strip()
+
+
+def parse_easyship_items(raw_line):
+    """Parse 'BD_6372=P2 x1 | PUR3030P1 x2 | PUR5080P1 x1' into
+    [(raw_sku, qty), ...]. A leading '|' is just the table's divider line
+    bleeding into the crop, not meaningful, so it's stripped."""
+    items = []
+    text = (raw_line or '').strip().lstrip('|').strip()
+    for segment in text.split('|'):
+        segment = segment.strip()
+        if not segment:
+            continue
+        m = re.match(r'^(.*?)\s*[xX]\s*(\d+)$', segment)
+        if m:
+            raw_sku = m.group(1).strip()
+            qty = int(m.group(2))
+            if raw_sku:
+                items.append((raw_sku, qty))
+    return items
+
+
+def create_easyship_overlay(items, page_w, page_h):
+    """Big, clear SKU/Qty stamp for Easy Ship labels, drawn into the blank
+    margin to the right of the barcode. SKU and qty go on separate lines
+    (not side-by-side) since that margin is narrow — splitting them lets
+    the font stay noticeably bigger than the tiny original table text.
+    Auto-shrinks only as far as needed for a long SKU or a multi-item order."""
+    packet = io.BytesIO()
+    c = canvas.Canvas(packet, pagesize=(page_w, page_h))
+    if not items:
+        c.save(); packet.seek(0); return packet
+
+    FONT = 'Helvetica-Bold'
+    bx0 = page_w * ES_STAMP_X0_FRAC
+    bx1 = page_w * ES_STAMP_X1_FRAC
+    by_top = page_h * (1 - ES_STAMP_TOP_FRAC)
+    by_bot_limit = page_h * (1 - ES_STAMP_BOT_FRAC)
+    avail_w = bx1 - bx0 - 12
+    avail_h = by_top - by_bot_limit - 12
+
+    lines = []
+    for s, q in items:
+        lines.append(s)
+        lines.append(f'\u00d7 {q}')
+
+    row_fs = 16.0
+    while row_fs > 8.0:
+        lh = row_fs + 5
+        total_h = len(lines) * lh
+        max_w = max(c.stringWidth(l, FONT, row_fs) for l in lines)
+        if total_h <= avail_h and max_w <= avail_w:
+            break
+        row_fs -= 1.0
+    lh = row_fs + 5
+
+    box_h = min(len(lines) * lh + 12, avail_h + 12)
+    box_w = avail_w + 12
+    by1 = by_top
+    by0 = by1 - box_h
+
+    c.setLineWidth(1.2)
+    c.setFillColorRGB(0.94, 0.94, 0.94)
+    c.rect(bx0, by0, box_w, box_h, stroke=1, fill=1)
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont(FONT, row_fs)
+    ry = by1 - 6 - row_fs
+    for l in lines:
+        c.drawString(bx0 + 6, ry, l)
+        ry -= lh
+
+    c.save()
+    packet.seek(0)
+    return packet
+
+
+def process_easyship(job_id, pdf_files, tmpdir):
+    """Job runner for the Amazon Easy Ship tab: full-page (A4) Evri labels
+    that already carry the SKU/Qty, just printed too small to read at a
+    glance. This OCRs that cell, stamps a big, clear version into the blank
+    margin, sorts labels by SKU, and prepends an A4 pick-list page — same
+    pattern as the 3rd-party tab, sized for this format's full page rather
+    than a 4x6 label. No postcode checking here (not asked for on this tab)."""
+    def update(progress, message):
+        with jobs_lock:
+            jobs[job_id]['progress'] = progress
+            jobs[job_id]['message'] = message
+
+    update(0, 'Reading Easy Ship labels...')
+    run_label = datetime.now(ZoneInfo('Europe/London')).strftime('%H%M')
+
+    page_entries = []
+    for path in pdf_files:
+        try:
+            try:
+                page_images = convert_from_path(str(path), dpi=ES_OCR_DPI)
+            except Exception:
+                page_images = []
+            with pdfplumber.open(path) as plumb:
+                n = len(plumb.pages)
+            for pidx in range(n):
+                img = page_images[pidx] if pidx < len(page_images) else None
+                raw_line = extract_easyship_raw_line(img)
+                raw_items = parse_easyship_items(raw_line)
+                items = []
+                for raw_sku, qty in raw_items:
+                    canonical_sku, was_mapped = get_canonical_sku(raw_sku)
+                    it = {'sku': canonical_sku, 'qty': qty}
+                    if was_mapped:
+                        it['raw_sku'] = raw_sku
+                    items.append(it)
+                page_entries.append({
+                    'path': path, 'index': pidx, 'items': items,
+                    'sort_key': items[0]['sku'].upper() if items else 'ZZZZ'
+                })
+        except Exception as e:
+            page_entries.append({'path': path, 'index': 0, 'items': [], 'error': str(e),
+                                  'sort_key': 'ZZZZ'})
+
+    error_entries = [e for e in page_entries if e.get('error')]
+    included_entries = [e for e in page_entries if not e.get('error')]
+    total_labels = max(len(page_entries), 1)
+
+    update(30, 'Sorting by SKU...')
+    included_entries.sort(key=lambda e: e['sort_key'])
+
+    pick_list = build_pick_list(included_entries)
+
+    # Pick list is always 4x6, same as the other tabs, regardless of the
+    # actual label page size (Easy Ship labels themselves stay full A4 —
+    # only the pick-list summary page is fixed at 4x6, printed on the same
+    # stock as everything else rather than as an A4 page mixed into the batch).
+    writer = PdfWriter()
+    if pick_list:
+        pick_list_buf = create_pick_list_page(pick_list, run_label, len(included_entries))
+        for pg in PdfReader(pick_list_buf).pages:
+            writer.add_page(pg)
+
+    results = []
+
+    for i, ent in enumerate(included_entries):
+        update(35 + int((i / max(len(included_entries), 1)) * 55),
+               'Stamping ' + str(i + 1) + '/' + str(len(included_entries)))
+        fname = Path(ent['path']).name
+        try:
+            reader = PdfReader(str(ent['path']))
+            page = reader.pages[ent['index']]
+            pw = float(page.mediabox.width)
+            ph = float(page.mediabox.height)
+            if ent['items']:
+                overlay_rows = [(it['sku'], it['qty']) for it in ent['items']]
+                ov = create_easyship_overlay(overlay_rows, pw, ph)
+                page.merge_page(PdfReader(ov).pages[0])
+            writer.add_page(page)
+
+            has_sku = bool(ent['items'])
+            results.append({
+                'file': fname, 'status': 'ok',
+                'items': ent['items'] or [{'sku': '(no SKU read)', 'qty': '?'}],
+                'order_id': '', 'page': i + 1, 'batch': run_label,
+                'carrier': 'Evri · Easy Ship',
+                'needs_check': not has_sku,
+                'warn_reason': None if has_sku else 'could not read SKU/Qty line'
+            })
+        except Exception as e:
+            results.append({'file': fname, 'status': 'error', 'error': str(e),
+                            'needs_check': False, 'warn_reason': None})
+
+    for ent in error_entries:
+        fname = Path(ent['path']).name
+        results.append({'file': fname, 'status': 'error', 'error': ent['error'],
+                        'needs_check': False, 'warn_reason': None})
+
+    update(95, 'Saving PDF...')
+    out_path = os.path.join(tmpdir, 'labels_easyship_' + job_id + '.pdf')
+    with open(out_path, 'wb') as f:
+        writer.write(f)
+
+    ok_count = len([r for r in results if r['status'] == 'ok'])
+    warn_count = len([r for r in results if r.get('needs_check')])
+    ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
+    download_name = 'labels_easyship_' + ts + '.pdf'
+
+    with open(out_path, 'rb') as f:
+        save_label_file(job_id, 'easyship', run_label, download_name, f.read())
+    save_pick_list_entries(job_id, 'easyship', run_label, pick_list)
+
+    with jobs_lock:
+        jobs[job_id]['status'] = 'done'
+        jobs[job_id]['progress'] = 100
+        msg = str(ok_count) + '/' + str(total_labels) + ' Easy Ship labels stamped'
+        if warn_count:
+            msg += ' — ⚠ ' + str(warn_count) + ' need checking'
+        jobs[job_id]['message'] = msg
+        jobs[job_id]['result_path'] = out_path
+        jobs[job_id]['results'] = results
+        jobs[job_id]['batch_id'] = run_label
+        jobs[job_id]['download_name'] = download_name
+        jobs[job_id]['pick_list'] = pick_list
+
+
 def process_thirdparty(job_id, pdf_files, tmpdir):
     """Job runner for the 3rd-party tab: one page = one finished label."""
     def update(progress, message):
@@ -1301,7 +1536,12 @@ def upload():
             'message': 'Starting — ' + str(len(pdf_files)) + ' PDF(s) found...',
             'result_path': None, 'results': [], 'batch_id': '', 'download_name': 'merged_labels.pdf'
         }
-    target = process_thirdparty if mode == 'thirdparty' else run_job
+    if mode == 'thirdparty':
+        target = process_thirdparty
+    elif mode == 'easyship':
+        target = process_easyship
+    else:
+        target = run_job
     t = threading.Thread(target=target, args=(job_id, pdf_files, tmpdir))
     t.daemon = True
     t.start()
@@ -1479,7 +1719,7 @@ def _pick_list_totals_query(monday, next_monday, tab_filter):
         WHERE created_at >= %s AND created_at < %s
     '''
     params = [monday, next_monday]
-    if tab_filter in ('amazon', 'thirdparty'):
+    if tab_filter in ('amazon', 'thirdparty', 'easyship'):
         query += ' AND tab = %s'
         params.append(tab_filter)
     query += ' GROUP BY sku ORDER BY total_qty DESC'
@@ -1544,7 +1784,7 @@ def pick_list_totals():
         <a href="/admin/pick-list-totals?week={next_week_str}&tab={tab_filter}">Next week &rarr;</a>
       </div>
       <div class="tabs" style="margin-bottom:1rem;">
-        {tab_link('all', 'All')} {tab_link('amazon', 'Amazon Orders')} {tab_link('thirdparty', '3rd-Party')}
+        {tab_link('all', 'All')} {tab_link('amazon', 'Amazon Orders')} {tab_link('thirdparty', '3rd-Party')} {tab_link('easyship', 'Easy Ship')}
         &nbsp;|&nbsp; <a href="/admin/pick-list-totals.csv?week={current_week_str}&tab={tab_filter}">Download CSV</a>
       </div>
       <table>
