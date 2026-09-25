@@ -114,6 +114,7 @@
   <div class="modebar">
     <button type="button" class="modebtn active" id="mode-amazon" onclick="setMode('amazon')">Amazon Orders</button>
     <button type="button" class="modebtn" id="mode-thirdparty" onclick="setMode('thirdparty')">3rd-Party Labels</button>
+    <button type="button" class="modebtn" id="mode-easyship" onclick="setMode('easyship')">Easy Ship</button>
   </div>
 
   <div class="card">
@@ -183,13 +184,15 @@ let uploadMode = 'amazon';
 
 const MODE_DESC = {
   amazon: 'Amazon order PDFs (label + packing slip). SKU & quantity are OCR-read from each slip and stamped onto the Evri label. One PDF out — print and go.',
-  thirdparty: '3rd-party labels that already have SKU & quantity printed on them. Each 4×8 label is resized to 4×6 and its SKU/qty is moved up into the empty space inside the label.'
+  thirdparty: '3rd-party labels that already have SKU & quantity printed on them. Each 4×8 label is resized to 4×6 and its SKU/qty is moved up into the empty space inside the label.',
+  easyship: 'Amazon Easy Ship labels (full-page Evri). SKU & quantity are already on the label but tiny — this reads that line and stamps a big, clear version in the blank margin.'
 };
 
 function setMode(m) {
   uploadMode = m;
   document.getElementById('mode-amazon').classList.toggle('active', m === 'amazon');
   document.getElementById('mode-thirdparty').classList.toggle('active', m === 'thirdparty');
+  document.getElementById('mode-easyship').classList.toggle('active', m === 'easyship');
   document.getElementById('mode-desc').textContent = MODE_DESC[m];
 }
 let pollInterval = null;
@@ -346,7 +349,7 @@ async function loadHistory() {
       return;
     }
     list.innerHTML = items.map(it => {
-      const title = it.tab === 'thirdparty' ? '3rd-Party Labels' : 'Amazon Orders';
+      const title = it.tab === 'thirdparty' ? '3rd-Party Labels' : (it.tab === 'easyship' ? 'Easy Ship' : 'Amazon Orders');
       const time = new Date(it.created_at).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
       return `<div class="history-row">
         <span class="hist-title">${title}</span>
