@@ -1096,13 +1096,17 @@ ES_SKU_RIGHT_FRAC = 0.97
 ES_SKU_BOT_FRAC = 0.833
 ES_OCR_DPI = 200
 
-# Blank margin to the right of the barcode, below the VAN/DROP/C-ROUND block
-# — the only genuinely open space on this dense template (checked against
-# every text element's real position; nothing else fits without overlap).
-ES_STAMP_X0_FRAC = 0.775
-ES_STAMP_X1_FRAC = 0.965
-ES_STAMP_TOP_FRAC = 0.75    # from top of page
-ES_STAMP_BOT_FRAC = 0.955   # from top of page
+# Blank band between the '92 TYNE' zone line and the VAN/DROP/C-ROUND
+# block. Checked against a real printed label: this spot is roughly twice
+# as wide as the old placement (below C-ROUND, right above the bottom
+# tracking barcode) and is safer — the old box's height allowance could
+# grow far enough down, on a multi-SKU order, to overlap the real barcode
+# start, since that box grew downward with no fixed floor tied to where
+# the barcode actually begins.
+ES_STAMP_X0_FRAC = 0.62
+ES_STAMP_X1_FRAC = 0.96
+ES_STAMP_TOP_FRAC = 0.54    # from top of page
+ES_STAMP_BOT_FRAC = 0.625   # from top of page
 
 
 def extract_easyship_raw_line(page_image):
@@ -1139,10 +1143,11 @@ def parse_easyship_items(raw_line):
 
 def create_easyship_overlay(items, page_w, page_h):
     """Big, clear SKU/Qty stamp for Easy Ship labels, drawn into the blank
-    margin to the right of the barcode. SKU and qty go on separate lines
-    (not side-by-side) since that margin is narrow — splitting them lets
-    the font stay noticeably bigger than the tiny original table text.
-    Auto-shrinks only as far as needed for a long SKU or a multi-item order."""
+    band between the '92 TYNE' zone line and the VAN/DROP/C-ROUND block.
+    SKU and qty share one line per item (e.g. '1818-P4 x 2') — this band
+    is wide enough for that, and it lets more distinct SKUs fit in the
+    limited height than the old stacked two-line-per-item layout did.
+    Auto-shrinks only as far as needed for a long SKU or several items."""
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
     if not items:
@@ -1156,12 +1161,9 @@ def create_easyship_overlay(items, page_w, page_h):
     avail_w = bx1 - bx0 - 12
     avail_h = by_top - by_bot_limit - 12
 
-    lines = []
-    for s, q in items:
-        lines.append(s)
-        lines.append(f'\u00d7 {q}')
+    lines = [f'{s} \u00d7 {q}' for s, q in items]
 
-    row_fs = 16.0
+    row_fs = 20.0
     while row_fs > 8.0:
         lh = row_fs + 5
         total_h = len(lines) * lh
