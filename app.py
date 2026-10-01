@@ -227,9 +227,34 @@ def normalize_sku_key(sku):
     key = re.sub(r'-{2,}', '-', key)
     return key
 
+def _ocr_fuzzy_candidates(key):
+    """Generate candidate normalized keys by swapping 0↔O and 5↔S at each
+    ambiguous position. Caps at 4 ambiguous positions (2^4=16 candidates max)
+    to avoid combinatorial blowup on pathological SKUs."""
+    SWAPS = {'0': 'O', 'O': '0', '5': 'S', 'S': '5'}
+    ambiguous = [i for i, ch in enumerate(key) if ch in SWAPS]
+    if not ambiguous:
+        return []
+    # Cap the number of positions we consider
+    ambiguous = ambiguous[:4]
+    candidates = []
+    for mask in range(1, 2 ** len(ambiguous)):
+        chars = list(key)
+        for bit, pos in enumerate(ambiguous):
+            if mask & (1 << bit):
+                chars[pos] = SWAPS[chars[pos]]
+        candidate = ''.join(chars)
+        if candidate != key:
+            candidates.append(candidate)
+    return candidates
+
+
 def get_canonical_sku(raw_sku):
     """Look up raw_sku against confirmed aliases. Returns (canonical_sku, was_mapped).
-    If no confirmed mapping exists, logs it to sku_unmapped and returns the raw SKU unchanged."""
+    If no confirmed mapping exists, tries fuzzy 0↔O / 5↔S correction against
+    already-confirmed canonical SKUs before falling back to the unmapped queue.
+    A fuzzy match is auto-confirmed as a new alias so the same garbled variant
+    resolves instantly next time."""
     if not raw_sku or raw_sku in ('NOT FOUND', 'ERROR'):
         return raw_sku, False
     key = normalize_sku_key(raw_sku)
@@ -249,7 +274,43 @@ def get_canonical_sku(raw_sku):
             cur.close()
             conn.close()
             return row['canonical_sku'], True
-        # No confirmed mapping — log/refresh it in the unmapped queue
+
+        # --- Fuzzy 0↔O / 5↔S fallback ---
+        # Only fires when exact lookup found nothing. Generates candidates by
+        # swapping these two known OCR-error pairs and checks if any single
+        # candidate matches an already-confirmed alias. If exactly one matches,
+        # use it and auto-register this garbled variant as a new confirmed alias.
+        candidates = _ocr_fuzzy_candidates(key)
+        if candidates:
+            placeholders = ','.join(['%s'] * len(candidates))
+            cur.execute(f'''
+                SELECT DISTINCT normalized_key, canonical_sku FROM sku_aliases
+                WHERE normalized_key IN ({placeholders})
+            ''', candidates)
+            fuzzy_rows = cur.fetchall()
+            # Deduplicate by canonical_sku — we want exactly one distinct canonical
+            distinct_canonicals = {}
+            for fr in fuzzy_rows:
+                distinct_canonicals[fr['canonical_sku']] = fr['normalized_key']
+            if len(distinct_canonicals) == 1:
+                matched_canonical = list(distinct_canonicals.keys())[0]
+                print(f"OCR fuzzy match: '{raw_sku}' (key={key}) → '{matched_canonical}' "
+                      f"(via 0↔O/5↔S swap)")
+                # Auto-register as a confirmed alias so it's instant next time
+                cur.execute('''
+                    INSERT INTO sku_aliases (normalized_key, raw_sku, canonical_sku, date_added, last_seen, times_seen)
+                    VALUES (%s, %s, %s, NOW(), NOW(), 1)
+                    ON CONFLICT (normalized_key, canonical_sku) DO UPDATE
+                    SET raw_sku = EXCLUDED.raw_sku, last_seen = NOW()
+                ''', (key, raw_sku, matched_canonical))
+                # Clean up from unmapped queue if it was there
+                cur.execute('DELETE FROM sku_unmapped WHERE normalized_key = %s', (key,))
+                conn.commit()
+                cur.close()
+                conn.close()
+                return matched_canonical, True
+
+        # No confirmed mapping and no fuzzy match — log/refresh in the unmapped queue
         cur.execute('''
             INSERT INTO sku_unmapped (normalized_key, raw_sku, first_seen, last_seen, times_seen, dismissed)
             VALUES (%s, %s, NOW(), NOW(), 1, FALSE)
@@ -1094,19 +1155,19 @@ ES_SKU_LEFT_FRAC = 0.28
 ES_SKU_TOP_FRAC = 0.803
 ES_SKU_RIGHT_FRAC = 0.97
 ES_SKU_BOT_FRAC = 0.833
-ES_OCR_DPI = 200
+ES_OCR_DPI = 300
+ES_OCR_WHITELIST = ('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+                     '0123456789 |=_-."')
+ES_OCR_BINARIZE_THRESHOLD = 150
 
-# Blank band between the '92 TYNE' zone line and the VAN/DROP/C-ROUND
-# block. Checked against a real printed label: this spot is roughly twice
-# as wide as the old placement (below C-ROUND, right above the bottom
-# tracking barcode) and is safer — the old box's height allowance could
-# grow far enough down, on a multi-SKU order, to overlap the real barcode
-# start, since that box grew downward with no fixed floor tied to where
-# the barcode actually begins.
-ES_STAMP_X0_FRAC = 0.62
-ES_STAMP_X1_FRAC = 0.96
-ES_STAMP_TOP_FRAC = 0.54    # from top of page
-ES_STAMP_BOT_FRAC = 0.625   # from top of page
+# Stamp placement: top of the label, between "M4 MART LIMITED" on the left
+# and "Marketplace / EVRi" on the right — a large, fully-blank area confirmed
+# by pixel-scanning a real test PDF. Considerably bigger (wider and taller)
+# than the previous placements, with no barcode overlap risk.
+ES_STAMP_X0_FRAC = 0.33
+ES_STAMP_X1_FRAC = 0.69
+ES_STAMP_TOP_FRAC = 0.02    # from top of page
+ES_STAMP_BOT_FRAC = 0.17    # from top of page
 
 
 def extract_easyship_raw_line(page_image):
@@ -1118,35 +1179,42 @@ def extract_easyship_raw_line(page_image):
         int(ES_SKU_LEFT_FRAC * w), int(ES_SKU_TOP_FRAC * h),
         int(ES_SKU_RIGHT_FRAC * w), int(ES_SKU_BOT_FRAC * h),
     )
-    crop = page_image.crop(box)
-    return pytesseract.image_to_string(crop, config='--psm 7').strip()
+    crop = page_image.crop(box).convert('L')
+    crop = crop.point(lambda p: 255 if p > ES_OCR_BINARIZE_THRESHOLD else 0)
+    config = "--psm 7 -c tessedit_char_whitelist='" + ES_OCR_WHITELIST + "'"
+    return pytesseract.image_to_string(crop, config=config).strip()
 
 
 def parse_easyship_items(raw_line):
     """Parse 'BD_6372=P2 x1 | PUR3030P1 x2 | PUR5080P1 x1' into
     [(raw_sku, qty), ...]. A leading '|' is just the table's divider line
-    bleeding into the crop, not meaningful, so it's stripped."""
+    bleeding into the crop, not meaningful, so it's stripped.
+    The qty part accepts OCR-mangled digits: 'l'/'L' → '1', 'O' → '0'
+    (Tesseract sometimes reads '1' as 'l' at any DPI — this caused items
+    to be silently dropped when the regex required \\d+ only)."""
     items = []
     text = (raw_line or '').strip().lstrip('|').strip()
     for segment in text.split('|'):
         segment = segment.strip()
         if not segment:
             continue
-        m = re.match(r'^(.*?)\s*[xX]\s*(\d+)$', segment)
+        m = re.match(r'^(.*?)\s*[xX]\s*([0-9lLoO]+)$', segment)
         if m:
             raw_sku = m.group(1).strip()
-            qty = int(m.group(2))
+            qty_str = m.group(2).replace('l', '1').replace('L', '1').replace('O', '0').replace('o', '0')
+            try:
+                qty = int(qty_str)
+            except ValueError:
+                continue
             if raw_sku:
                 items.append((raw_sku, qty))
     return items
 
 
 def create_easyship_overlay(items, page_w, page_h):
-    """Big, clear SKU/Qty stamp for Easy Ship labels, drawn into the blank
-    band between the '92 TYNE' zone line and the VAN/DROP/C-ROUND block.
-    SKU and qty share one line per item (e.g. '1818-P4 x 2') — this band
-    is wide enough for that, and it lets more distinct SKUs fit in the
-    limited height than the old stacked two-line-per-item layout did.
+    """Big, clear SKU/Qty stamp for Easy Ship labels, drawn at the top of
+    the label between 'M4 MART LIMITED' on the left and 'Marketplace / EVRi'
+    on the right. SKU and qty share one line per item (e.g. '1818-P4 x 2').
     Auto-shrinks only as far as needed for a long SKU or several items."""
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
