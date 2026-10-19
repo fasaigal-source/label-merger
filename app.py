@@ -1621,13 +1621,13 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
 #   odd  pages (1, 3, 5, …) = packing slip    (283×425 pt, text layer)
 # We keep only the labels; SKU + qty come from the paired packing slip.
 
-# Stamp placement: top of the label, in the sender/logo area (y 0–40pt).
-# This region has the sender name ("M 4 Mart Limited") and EVRi logo — the
-# least-critical info for the packer.  No barcode overlap.
-ED_STAMP_TOP_PT = 2      # from top of page
-ED_STAMP_BOT_PT = 38     # from top of page
-ED_STAMP_LEFT_PT = 4
-ED_STAMP_RIGHT_PAD = 4   # from right edge
+# Stamp placement: to the RIGHT of the 2D barcode, in the empty space.
+# The barcode occupies roughly x=3–170, y=40–125 (from top of page).
+# The stamp goes in the blank rectangle beside it.
+ED_STAMP_TOP_PT = 42     # from top of page (top of barcode area)
+ED_STAMP_BOT_PT = 122    # from top of page (bottom of barcode area)
+ED_STAMP_LEFT_PT = 172   # right edge of barcode + small gap
+ED_STAMP_RIGHT_PAD = 4   # from right edge of label
 
 
 def extract_evri_direct_items(plumb_page):
