@@ -96,6 +96,12 @@
   .history-row .hist-time { color: var(--muted); font-size: 12px; }
   .history-row .hist-dl { margin-left: auto; font-size: 12px; font-weight: 600; color: var(--blue); text-decoration: none; white-space: nowrap; }
   .history-row .hist-dl:hover { text-decoration: underline; }
+  .tracking-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; font-size: 13px; background: var(--bg); margin-bottom: 5px; }
+  .tracking-row .track-channel { font-weight: 600; min-width: 60px; }
+  .tracking-row .track-count { color: var(--muted); flex: 1; }
+  .tracking-row a { font-size: 12px; font-weight: 600; color: var(--blue); text-decoration: none; white-space: nowrap; }
+  .tracking-row a:hover { text-decoration: underline; }
+  .tracking-dup { font-size: 12px; color: var(--muted); margin-top: 4px; }
   @media (max-width: 500px) { .steps { grid-template-columns: 1fr; } h1 { font-size: 22px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>
 </head>
@@ -161,6 +167,11 @@
     <div id="pick-list-section" style="display:none;">
       <div class="card-title">Pick List — grab before packing</div>
       <div id="pick-list-rows"></div>
+    </div>
+
+    <div id="tracking-section" style="display:none;">
+      <div class="card-title">Tracking Uploads</div>
+      <div id="tracking-downloads"></div>
     </div>
 
     <div id="results-list"></div>
@@ -313,6 +324,32 @@ function showResults(data) {
     const warnRow = isWarn && r.warn_reason ? `<span class="warn-reason">⚠ ${r.warn_reason}</span>` : '';
     return `<div class="result-row${isWarn ? ' warn' : ''}">${badge}<span class="fname">${r.file}</span><span class="skus">${skuText}</span>${mappedNote}${postcodeNote}${warnRow}</div>`;
   }).join('');
+  // Tracking uploads section
+  const trackingFiles = data.tracking_files || [];
+  const trackingSummary = data.tracking_summary || {};
+  const trackSection = document.getElementById('tracking-section');
+  if (trackingFiles.length) {
+    let html = trackingFiles.map(tf => {
+      const label = tf.channel === 'tesco' ? 'Tesco' : 'B&Q';
+      const ext = tf.channel === 'tesco' ? '.xlsx' : '.csv';
+      return `<div class="tracking-row">
+        <span class="track-channel">📦 ${label}</span>
+        <span class="track-count">${tf.count} order${tf.count !== 1 ? 's' : ''}</span>
+        <a href="/download-tracking/${currentJobId}/${tf.channel}">⬇ Download ${ext}</a>
+      </div>`;
+    }).join('');
+    if (trackingSummary.skipped_dup) {
+      html += `<div class="tracking-dup">ℹ ${trackingSummary.skipped_dup} order${trackingSummary.skipped_dup !== 1 ? 's' : ''} already uploaded — skipped</div>`;
+    }
+    if (trackingSummary.no_tracking) {
+      html += `<div class="tracking-dup">⚠ ${trackingSummary.no_tracking} label${trackingSummary.no_tracking !== 1 ? 's' : ''} had no tracking data</div>`;
+    }
+    document.getElementById('tracking-downloads').innerHTML = html;
+    trackSection.style.display = 'block';
+  } else {
+    trackSection.style.display = 'none';
+  }
+
   document.getElementById('results-section').style.display = 'block';
   if (ok > 0) {
     const dl = document.getElementById('download-btn');
