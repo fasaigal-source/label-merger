@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os, re, io, csv, json, zipfile, tempfile, threading, uuid, string, html as html_module
+from openpyxl import Workbook
+from openpyxl.styles import Font
 from pathlib import Path
 from functools import wraps
 from datetime import datetime, timedelta
@@ -93,6 +95,32 @@ def init_db():
                 batch_id TEXT,
                 sku TEXT NOT NULL,
                 qty INTEGER NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        ''')
+        # Tracking uploads: remember which order IDs have already had their
+        # tracking written to a Tesco / B&Q file, so we never re-upload them.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS tracking_uploads (
+                id SERIAL PRIMARY KEY,
+                order_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                tracking_number TEXT NOT NULL,
+                carrier TEXT NOT NULL,
+                job_id TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                UNIQUE (order_id, channel)
+            )
+        ''')
+        # Tracking files (Tesco xlsx / B&Q csv) stored alongside label files.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS tracking_files (
+                id SERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                file_data BYTEA NOT NULL,
+                order_count INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
         ''')
@@ -1615,6 +1643,255 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
         jobs[job_id]['pick_list'] = pick_list
 
 
+# ── TRACKING UPLOAD HELPERS (Tesco + B&Q) ─────────────────────────────────────
+# Extract order ID + tracking from Evri Direct labels, classify by channel,
+# and generate Mirakl-format tracking upload files.
+
+def classify_order_id(order_id):
+    """Classify a marketplace order ID by its format.
+    Returns 'tesco', 'bnq', 'amazon', 'shopify', or 'unknown'.
+    """
+    if not order_id:
+        return 'unknown'
+    oid = re.sub(r'-R\d+$', '', order_id.strip())  # strip replacement suffix
+    if re.match(r'^\d{3,4}-\d{3,4}-\d{2,3}-[A-Z]$', oid):
+        return 'tesco'
+    if re.match(r'^\d{6,}-[A-Z]$', oid):
+        return 'bnq'
+    if re.match(r'^\d{3}-\d{7}-\d{7}$', oid):
+        return 'amazon'
+    if re.match(r'^#\d+$', oid):
+        return 'shopify'
+    return 'unknown'
+
+def extract_tracking_from_label(label_text):
+    """Extract the Evri tracking number from label text layer.
+    The label contains a line like 'H-08P0-A-000000001-5' which is the
+    tracking number with dashes. We strip dashes to get 'H08P0A0000000015'.
+    """
+    if not label_text:
+        return None
+    # Match the H-xxPx-A-xxxxxxxxx-x pattern
+    m = re.search(r'\b(H-?\d{2}P\d-?[A-Z]-?\d{6,}-?\d)\b', label_text)
+    if m:
+        return m.group(1).replace('-', '')
+    # Also try matching a clean 16-char tracking number directly
+    m = re.search(r'\b(H\d{2}P\d[A-Z]\d{10})\b', label_text)
+    if m:
+        return m.group(1)
+    return None
+
+def extract_order_id_from_label(label_text):
+    """Extract the marketplace order ID from the label text layer.
+    The label has 'Reference 2 <order_id>' where order_id is the
+    marketplace order number (Tesco, B&Q, Amazon, etc.).
+    """
+    if not label_text:
+        return None
+    m = re.search(r'Reference\s+2\s+(\S+)', label_text)
+    if m:
+        return m.group(1)
+    return None
+
+def extract_evr_reference_from_label(label_text):
+    """Extract the EVR reference number from the label text.
+    The label has 'Reference 1 EVR########'.
+    """
+    if not label_text:
+        return None
+    m = re.search(r'Reference\s+1\s+(EVR\d+)', label_text)
+    if m:
+        return m.group(1)
+    return None
+
+def resolve_carrier(tracking_number):
+    """Determine carrier from tracking number pattern.
+    Returns dict with carrier info for both Tesco and B&Q formats.
+    """
+    if not tracking_number:
+        return None
+    if re.match(r'^GV\d+GB$', tracking_number):
+        return {
+            'name': 'Royal Mail',
+            'tesco_code': 'Royal Mail',
+            'tesco_standard_code': '',
+            'tesco_name': 'Royal Mail',
+            'bnq_code': 'RM',
+            'bnq_standard_code': 'gb-post',
+            'bnq_name': 'Royal Mail',
+            'url_template': 'https://www.royalmail.com/track-your-item#/tracking-results/{tn}',
+        }
+    # Default: Evri (H081IA…, H08P0A…, etc.)
+    return {
+        'name': 'Evri',
+        'tesco_code': 'Evri',
+        'tesco_standard_code': '',
+        'tesco_name': 'Evri',
+        'bnq_code': 'EVR',
+        'bnq_standard_code': 'hermes-uk',
+        'bnq_name': 'Evri',
+        'url_template': 'https://www.evri.com/track/parcel/{tn}/details',
+    }
+
+def get_already_uploaded_tracking(order_ids):
+    """Check which order IDs have already been uploaded for tracking.
+    Returns a set of order IDs that are already in the tracking_uploads table.
+    """
+    if not order_ids:
+        return set()
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            'SELECT order_id FROM tracking_uploads WHERE order_id = ANY(%s)',
+            (list(order_ids),)
+        )
+        result = {row[0] for row in cur.fetchall()}
+        cur.close()
+        conn.close()
+        return result
+    except Exception as e:
+        print(f"Tracking history check error: {e}")
+        return set()
+
+def save_tracking_uploads(records, job_id):
+    """Persist tracking records so they won't be re-uploaded next time.
+    records: list of dicts with order_id, channel, tracking_number, carrier.
+    """
+    if not records:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        for r in records:
+            cur.execute('''
+                INSERT INTO tracking_uploads (order_id, channel, tracking_number, carrier, job_id)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (order_id, channel) DO UPDATE SET
+                    tracking_number = EXCLUDED.tracking_number,
+                    carrier = EXCLUDED.carrier,
+                    job_id = EXCLUDED.job_id
+            ''', (r['order_id'], r['channel'], r['tracking_number'], r['carrier'], job_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Save tracking uploads error: {e}")
+
+def save_tracking_file(job_id, channel, filename, file_data, order_count):
+    """Store a generated tracking file (Tesco xlsx or B&Q csv) in the DB."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO tracking_files (job_id, channel, filename, file_data, order_count)
+            VALUES (%s, %s, %s, %s, %s)
+        ''', (job_id, channel, filename, psycopg2.Binary(file_data), order_count))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Save tracking file error: {e}")
+
+
+def generate_tesco_tracking_xlsx(orders, job_id):
+    """Generate Tesco Marketplace tracking upload XLSX.
+    orders: list of dicts with keys: order_id, tracking_number, carrier (resolved carrier dict).
+    Returns (filename, bytes) or None if no orders.
+    """
+    if not orders:
+        return None
+    wb = Workbook()
+
+    # ── Data sheet ──
+    ws = wb.active
+    ws.title = 'Data'
+    font_bold = Font(name='Calibri', size=11, bold=True)
+    font_normal = Font(name='Calibri', size=11, bold=False)
+
+    # Row 1: display headers (bold)
+    display_headers = ['Order number', 'Carrier Code', 'Carrier standard code',
+                       'Carrier Name', 'Carrier URL', 'Tracking number']
+    for col_idx, hdr in enumerate(display_headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=hdr)
+        cell.font = font_bold
+
+    # Row 2: field keys (bold)
+    field_keys = ['order-id', 'carrier-code', 'carrier-standard-code',
+                  'carrier-name', 'carrier-url', 'tracking-number']
+    for col_idx, key in enumerate(field_keys, 1):
+        cell = ws.cell(row=2, column=col_idx, value=key)
+        cell.font = font_bold
+
+    # Data rows from row 3 (non-bold)
+    for row_idx, o in enumerate(orders, 3):
+        carrier = o['carrier']
+        tn = o['tracking_number']
+        url = carrier['url_template'].format(tn=tn)
+        row_data = [
+            o['order_id'],
+            carrier['tesco_code'],
+            carrier['tesco_standard_code'],
+            carrier['tesco_name'],
+            url,
+            tn,
+        ]
+        for col_idx, val in enumerate(row_data, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.font = font_normal
+
+    # ── ReferenceData sheet ──
+    ws_ref = wb.create_sheet('ReferenceData')
+    ws_ref.cell(row=1, column=1, value='carrier-code').font = font_bold
+    for ri, cname in enumerate(['Evri', 'Royal Mail'], 2):
+        ws_ref.cell(row=ri, column=1, value=cname).font = font_normal
+
+    # Save to bytes
+    buf = io.BytesIO()
+    wb.save(buf)
+    file_bytes = buf.getvalue()
+
+    ts = datetime.now().strftime('%d-%b-%Y').lower()
+    filename = f'tesco-tracking-upload-{ts}.xlsx'
+
+    save_tracking_file(job_id, 'tesco', filename, file_bytes, len(orders))
+    return filename, file_bytes
+
+
+def generate_bnq_tracking_csv(orders, job_id):
+    """Generate B&Q Marketplace tracking upload CSV (semicolon-delimited).
+    orders: list of dicts with keys: order_id, tracking_number, carrier (resolved carrier dict).
+    Returns (filename, bytes) or None if no orders.
+    """
+    if not orders:
+        return None
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter=';', quoting=csv.QUOTE_NONE)
+    writer.writerow(['order-id', 'carrier-code', 'carrier-standard-code',
+                     'carrier-name', 'carrier-url', 'tracking-number'])
+
+    for o in orders:
+        carrier = o['carrier']
+        tn = o['tracking_number']
+        url = carrier['url_template'].format(tn=tn)
+        writer.writerow([
+            o['order_id'],
+            carrier['bnq_code'],
+            carrier['bnq_standard_code'],
+            carrier['bnq_name'],
+            url,
+            tn,
+        ])
+
+    file_bytes = buf.getvalue().encode('utf-8')
+    ts = datetime.now().strftime('%d-%b-%Y').lower()
+    filename = f'bnq-tracking-upload-{ts}.csv'
+
+    save_tracking_file(job_id, 'bnq', filename, file_bytes, len(orders))
+    return filename, file_bytes
+
+
 # ── EVRI DIRECT (Business Account) ────────────────────────────────────────────
 # Labels from the Evri direct business account.  PDF alternates:
 #   even pages (0, 2, 4, …) = shipping label  (283×425 pt, text layer)
@@ -1835,10 +2112,16 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
                             'reason': 'Could not read postcode'
                         }
 
+                    # Extract order ID and tracking number from label text layer
+                    order_id = extract_order_id_from_label(label_text)
+                    tracking_number = extract_tracking_from_label(label_text)
+
                     page_entries.append({
                         'path': path, 'index': pidx, 'items': items,
                         'postcode': postcode_info,
-                        'sort_key': items[0]['sku'].upper() if items else 'ZZZZ'
+                        'sort_key': items[0]['sku'].upper() if items else 'ZZZZ',
+                        'order_id': order_id,
+                        'tracking_number': tracking_number,
                     })
         except Exception as e:
             page_entries.append({'path': path, 'index': 0, 'items': [], 'error': str(e),
@@ -1942,6 +2225,72 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
         save_label_file(job_id, 'evri_direct', run_label, download_name, f.read())
     save_pick_list_entries(job_id, 'evri_direct', run_label, pick_list)
 
+    # ── Tracking upload generation ──────────────────────────────────────────
+    update(96, 'Generating tracking uploads...')
+    tracking_summary = {'tesco': 0, 'bnq': 0, 'skipped_dup': 0,
+                        'skipped_unknown': 0, 'no_tracking': 0,
+                        'tesco_file': None, 'bnq_file': None}
+    tracking_files_info = []
+
+    # Collect tracking data from all included entries (labels that went into the PDF)
+    all_tracking = []
+    for ent in included_entries:
+        oid = ent.get('order_id')
+        tn = ent.get('tracking_number')
+        if not oid or not tn:
+            tracking_summary['no_tracking'] += 1
+            continue
+        channel = classify_order_id(oid)
+        carrier = resolve_carrier(tn)
+        all_tracking.append({
+            'order_id': oid,
+            'tracking_number': tn,
+            'channel': channel,
+            'carrier': carrier,
+        })
+
+    # De-duplicate against tracking history
+    if all_tracking:
+        existing_oids = get_already_uploaded_tracking([t['order_id'] for t in all_tracking])
+        new_tracking = []
+        for t in all_tracking:
+            if t['order_id'] in existing_oids:
+                tracking_summary['skipped_dup'] += 1
+            elif t['channel'] not in ('tesco', 'bnq'):
+                tracking_summary['skipped_unknown'] += 1
+            else:
+                new_tracking.append(t)
+
+        tesco_orders = [t for t in new_tracking if t['channel'] == 'tesco']
+        bnq_orders = [t for t in new_tracking if t['channel'] == 'bnq']
+
+        if tesco_orders:
+            result = generate_tesco_tracking_xlsx(tesco_orders, job_id)
+            if result:
+                tracking_summary['tesco'] = len(tesco_orders)
+                tracking_summary['tesco_file'] = result[0]
+                tracking_files_info.append({
+                    'channel': 'tesco', 'filename': result[0],
+                    'count': len(tesco_orders)
+                })
+
+        if bnq_orders:
+            result = generate_bnq_tracking_csv(bnq_orders, job_id)
+            if result:
+                tracking_summary['bnq'] = len(bnq_orders)
+                tracking_summary['bnq_file'] = result[0]
+                tracking_files_info.append({
+                    'channel': 'bnq', 'filename': result[0],
+                    'count': len(bnq_orders)
+                })
+
+        # Persist all new tracking records
+        records_to_save = [{'order_id': t['order_id'], 'channel': t['channel'],
+                            'tracking_number': t['tracking_number'],
+                            'carrier': t['carrier']['name']}
+                           for t in new_tracking]
+        save_tracking_uploads(records_to_save, job_id)
+
     with jobs_lock:
         jobs[job_id]['status'] = 'done'
         jobs[job_id]['progress'] = 100
@@ -1952,12 +2301,24 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
             msg += ' — 🚫 ' + str(out_of_area_count) + ' out of area'
         if check_pc_count:
             msg += ' — ⚠ ' + str(check_pc_count) + ' need postcode check'
+        # Tracking summary
+        t_parts = []
+        if tracking_summary['tesco']:
+            t_parts.append(str(tracking_summary['tesco']) + ' Tesco')
+        if tracking_summary['bnq']:
+            t_parts.append(str(tracking_summary['bnq']) + ' B&Q')
+        if t_parts:
+            msg += ' — 📦 Tracking: ' + ', '.join(t_parts)
+        if tracking_summary['skipped_dup']:
+            msg += ' (' + str(tracking_summary['skipped_dup']) + ' already uploaded)'
         jobs[job_id]['message'] = msg
         jobs[job_id]['result_path'] = out_path
         jobs[job_id]['results'] = results
         jobs[job_id]['batch_id'] = run_label
         jobs[job_id]['download_name'] = download_name
         jobs[job_id]['pick_list'] = pick_list
+        jobs[job_id]['tracking_summary'] = tracking_summary
+        jobs[job_id]['tracking_files'] = tracking_files_info
 
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
@@ -2041,6 +2402,282 @@ def download(job_id):
     filename, file_data = row
     return send_file(io.BytesIO(bytes(file_data)), as_attachment=True,
                      download_name=filename, mimetype='application/pdf')
+
+@app.route('/download-tracking/<job_id>/<channel>')
+def download_tracking(job_id, channel):
+    """Serve a generated tracking upload file (Tesco xlsx or B&Q csv) from the DB."""
+    if channel not in ('tesco', 'bnq'):
+        return jsonify({'error': 'Invalid channel'}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT filename, file_data FROM tracking_files WHERE job_id = %s AND channel = %s',
+                    (job_id, channel))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    if not row:
+        return jsonify({'error': 'Tracking file not found'}), 404
+    filename, file_data = row
+    if channel == 'tesco':
+        mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    else:
+        mime = 'text/csv'
+    return send_file(io.BytesIO(bytes(file_data)), as_attachment=True,
+                     download_name=filename, mimetype=mime)
+
+# ── MIRAKL → EVRI CONVERTER ─────────────────────────────────────────────────
+
+# SKU → weight mapping (kg) – used when the Mirakl export has no Weight column.
+# Updated via the converter UI; persisted per-session for now.
+SKU_WEIGHT_MAP = {}
+
+def parse_mirakl_csv(file_data):
+    """Parse a Mirakl order export CSV (Tesco or B&Q).
+    Auto-detects delimiter and marketplace.
+    Returns (marketplace, list_of_order_dicts).
+    """
+    text = file_data.decode('utf-8-sig')
+    # Detect delimiter: B&Q uses semicolons, Tesco uses commas
+    first_line = text.split('\n')[0]
+    if first_line.count(';') > first_line.count(','):
+        delimiter = ';'
+        marketplace = 'bnq'
+    else:
+        delimiter = ','
+        marketplace = 'tesco'
+
+    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+    orders = []
+    for row in reader:
+        # Skip empty rows
+        if not row.get('Order number', '').strip():
+            continue
+        orders.append(row)
+    return marketplace, orders
+
+
+def extract_item_name(details_str):
+    """Extract a clean product name from the Mirakl 'Details' field.
+    E.g. 'Bamboo Memory Foam... (Product SKU : ... | Offer SKU : ...)' → 'Bamboo Memory Foam...'
+    """
+    if not details_str:
+        return ''
+    # Strip the (Product SKU : ... | Offer SKU : ...) suffix
+    match = re.match(r'^(.+?)\s*\(Product SKU\s*:', details_str)
+    if match:
+        return match.group(1).strip().strip('"')
+    return details_str.strip().strip('"')
+
+
+def get_weight_kg(row, marketplace):
+    """Get weight in Kg from a Mirakl order row.
+    Tesco orders_5 has 'Weight' in grams.  Others may not have it.
+    Falls back to SKU_WEIGHT_MAP, then to a sensible default.
+    """
+    # Try the Weight column (Tesco variant with gram values)
+    w = row.get('Weight', '').strip()
+    if w and w.replace('.', '', 1).isdigit():
+        grams = float(w)
+        if grams > 100:
+            # Value is in grams — convert to kg
+            return round(grams / 1000, 2)
+        else:
+            # Already in kg
+            return round(grams, 2)
+
+    # Fall back to SKU weight map
+    sku = row.get('Seller SKU', row.get('Shop SKU', '')).strip()
+    if sku and sku in SKU_WEIGHT_MAP:
+        return SKU_WEIGHT_MAP[sku]
+
+    # Default: 2kg (typical pillow shipment)
+    return 2.0
+
+
+def mirakl_to_evri_rows(orders, marketplace):
+    """Convert parsed Mirakl orders to Evri CSV rows.
+    Returns (evri_rows, zone_b_orders, stats_dict).
+    Each evri_row is a dict matching Evri column headers.
+    """
+    evri_rows = []
+    zone_b_orders = []
+    stats = {'total': len(orders), 'converted': 0, 'zone_b': 0, 'skipped': 0}
+
+    for row in orders:
+        order_num = row.get('Order number', '').strip()
+        quantity = int(row.get('Quantity', '1').strip() or '1')
+
+        # Get product name
+        item_name = extract_item_name(row.get('Details', ''))
+
+        # Value — order amount
+        value = row.get('Amount', '0').strip()
+
+        # Weight
+        weight_kg = get_weight_kg(row, marketplace)
+
+        # SKU
+        if marketplace == 'bnq':
+            sku = row.get('Shop SKU', '').strip()
+        else:
+            sku = row.get('Seller SKU', '').strip()
+
+        # Recipient name
+        first_name = row.get('Shipping address first name', '').strip()
+        last_name = row.get('Shipping address last name', '').strip()
+        name = f"{first_name} {last_name}".strip()
+
+        # Address
+        company = row.get('Shipping address company', '').strip()
+        street1 = row.get('Shipping address street 1', '').strip()
+        street2 = row.get('Shipping address street 2', '').strip()
+        postcode = row.get('Shipping address zip', '').strip()
+        city = row.get('Shipping address city', '').strip()
+        state = row.get('Shipping address state', '').strip()
+        country_raw = row.get('Shipping address country', '').strip()
+        phone = row.get('Shipping address phone', '').strip()
+
+        # Normalise country code to ISO2
+        country = 'GB'
+        if country_raw.upper() in ('GBR', 'UK', 'GB'):
+            country = 'GB'
+        elif country_raw:
+            country = country_raw[:2].upper()
+
+        # Property = company + street1 if company present, else street1
+        if company:
+            prop = company + ', ' + street1
+        else:
+            prop = street1
+        street = street2
+
+        # Check Zone B / out-of-area
+        flagged, reason = is_out_of_area(postcode)
+        if flagged:
+            zone_b_orders.append({
+                'order': order_num,
+                'name': name,
+                'postcode': postcode,
+                'reason': reason
+            })
+            stats['zone_b'] += 1
+            continue  # Skip out-of-area orders
+
+        # Build Evri row — one row per unit of quantity
+        for _ in range(quantity):
+            evri_row = {
+                'Item Name': item_name[:80] if item_name else f'Order {order_num}',
+                'Value': value,
+                'Weight': weight_kg,
+                'Length': '',
+                'Width': '',
+                'Height': '',
+                'Name': name,
+                'Property': prop,
+                'Street': street,
+                'Town': city,
+                'County': state,
+                'PostCode': postcode,
+                'Country': country,
+                'Telephone': phone,
+                'Reference': order_num,
+                'SKU': sku,
+                'Quantity': 1,
+                'Email': ''
+            }
+            evri_rows.append(evri_row)
+
+        stats['converted'] += quantity
+
+    return evri_rows, zone_b_orders, stats
+
+
+@app.route('/convert-mirakl', methods=['POST'])
+def convert_mirakl():
+    """Accept one or more Mirakl order export CSVs and return an Evri bulk-upload CSV."""
+    uploaded = request.files.getlist('files') or request.files.getlist('file')
+    if not uploaded:
+        return jsonify({'error': 'No file uploaded'}), 400
+
+    all_evri_rows = []
+    all_zone_b = []
+    all_stats = {'total': 0, 'converted': 0, 'zone_b': 0, 'files': 0, 'marketplaces': set()}
+
+    for f in uploaded:
+        if not f.filename.lower().endswith('.csv'):
+            continue
+        file_data = f.read()
+        try:
+            marketplace, orders = parse_mirakl_csv(file_data)
+        except Exception as e:
+            return jsonify({'error': f'Error parsing {f.filename}: {str(e)}'}), 400
+
+        evri_rows, zone_b, stats = mirakl_to_evri_rows(orders, marketplace)
+        all_evri_rows.extend(evri_rows)
+        all_zone_b.extend(zone_b)
+        all_stats['total'] += stats['total']
+        all_stats['converted'] += stats['converted']
+        all_stats['zone_b'] += stats['zone_b']
+        all_stats['files'] += 1
+        all_stats['marketplaces'].add(marketplace)
+
+    if not all_evri_rows:
+        return jsonify({
+            'error': 'No orders to convert' + (f' ({all_stats["zone_b"]} excluded as Zone B/out-of-area)' if all_stats['zone_b'] else ''),
+            'zone_b': all_zone_b,
+            'stats': {**all_stats, 'marketplaces': list(all_stats['marketplaces'])}
+        }), 400
+
+    # Generate the Evri CSV
+    output = io.StringIO()
+    fieldnames = ['Item Name', 'Value', 'Weight', 'Length', 'Width', 'Height',
+                  'Name', 'Property', 'Street', 'Town', 'County', 'PostCode',
+                  'Country', 'Telephone', 'Reference', 'SKU', 'Quantity', 'Email']
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(all_evri_rows)
+    csv_bytes = output.getvalue().encode('utf-8')
+
+    # Store in memory for download
+    job_id = str(uuid.uuid4())[:8]
+    with jobs_lock:
+        jobs[job_id] = {
+            'status': 'done',
+            'type': 'mirakl_convert',
+            'csv_data': csv_bytes,
+            'filename': f'evri_upload_{datetime.now().strftime("%Y%m%d_%H%M")}.csv'
+        }
+
+    return jsonify({
+        'job_id': job_id,
+        'stats': {
+            'total_orders': all_stats['total'],
+            'converted_rows': all_stats['converted'],
+            'zone_b': all_stats['zone_b'],
+            'files_processed': all_stats['files'],
+            'marketplaces': list(all_stats['marketplaces'])
+        },
+        'zone_b': all_zone_b
+    })
+
+
+@app.route('/download-evri-csv/<job_id>')
+def download_evri_csv(job_id):
+    """Serve the generated Evri bulk-upload CSV."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job or job.get('type') != 'mirakl_convert':
+        return jsonify({'error': 'File not found'}), 404
+    return send_file(
+        io.BytesIO(job['csv_data']),
+        as_attachment=True,
+        download_name=job['filename'],
+        mimetype='text/csv'
+    )
+
 
 @app.route('/label-history')
 def label_history():
