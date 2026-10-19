@@ -11,7 +11,7 @@ from reportlab.pdfgen import canvas
 import pytesseract
 import pdfplumber
 import psycopg2
-from postcode_checker import check_label_postcode, render_pdf_pages
+from postcode_checker import check_label_postcode, render_pdf_pages, extract_postcode_from_text, is_out_of_area
 from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
@@ -1170,19 +1170,65 @@ ES_STAMP_TOP_FRAC = 0.02    # from top of page
 ES_STAMP_BOT_FRAC = 0.17    # from top of page
 
 
-def extract_easyship_raw_line(page_image):
-    """OCR the SKU/Qty table cell off a rendered Easy Ship label page."""
-    if page_image is None:
-        return ''
+def _ocr_crop(page_image, left, top, right, bot):
+    """OCR a rectangular region of a rendered page image. Returns the raw
+    text string (stripped). Applies binarization + character whitelist."""
     w, h = page_image.size
-    box = (
-        int(ES_SKU_LEFT_FRAC * w), int(ES_SKU_TOP_FRAC * h),
-        int(ES_SKU_RIGHT_FRAC * w), int(ES_SKU_BOT_FRAC * h),
-    )
+    box = (int(left * w), int(top * h), int(right * w), int(bot * h))
     crop = page_image.crop(box).convert('L')
     crop = crop.point(lambda p: 255 if p > ES_OCR_BINARIZE_THRESHOLD else 0)
     config = "--psm 7 -c tessedit_char_whitelist='" + ES_OCR_WHITELIST + "'"
     return pytesseract.image_to_string(crop, config=config).strip()
+
+
+def extract_easyship_raw_line(page_image):
+    """OCR the SKU/Qty table cell off a rendered Easy Ship label page.
+    If the primary crop returns nothing, retries with a slightly expanded
+    region (some label variants shift the table row a few pixels) and also
+    tries PSM 6 (block mode) as a fallback. Logs diagnostics for tracing
+    failures in Railway."""
+    if page_image is None:
+        print("ES OCR: page_image is None — skipping")
+        return ''
+    # Primary attempt — tight crop, PSM 7 (single line)
+    result = _ocr_crop(page_image,
+                       ES_SKU_LEFT_FRAC, ES_SKU_TOP_FRAC,
+                       ES_SKU_RIGHT_FRAC, ES_SKU_BOT_FRAC)
+    if result:
+        print(f"ES OCR OK: '{result}'")
+        return result
+
+    # Retry 1: expanded crop (±2% vertically, ±3% horizontally) in case
+    # the SKU row is shifted on this label variant
+    print("ES OCR: primary crop empty, retrying with expanded region...")
+    result = _ocr_crop(page_image,
+                       max(0, ES_SKU_LEFT_FRAC - 0.03),
+                       max(0, ES_SKU_TOP_FRAC - 0.02),
+                       min(1, ES_SKU_RIGHT_FRAC + 0.03),
+                       min(1, ES_SKU_BOT_FRAC + 0.02))
+    if result:
+        print(f"ES OCR OK (expanded crop): '{result}'")
+        return result
+
+    # Retry 2: try PSM 6 (block of text) on the expanded crop — catches
+    # multi-line SKU cells that PSM 7 misses
+    w, h = page_image.size
+    box = (int(max(0, ES_SKU_LEFT_FRAC - 0.03) * w),
+           int(max(0, ES_SKU_TOP_FRAC - 0.02) * h),
+           int(min(1, ES_SKU_RIGHT_FRAC + 0.03) * w),
+           int(min(1, ES_SKU_BOT_FRAC + 0.02) * h))
+    crop = page_image.crop(box).convert('L')
+    crop = crop.point(lambda p: 255 if p > ES_OCR_BINARIZE_THRESHOLD else 0)
+    config6 = "--psm 6 -c tessedit_char_whitelist='" + ES_OCR_WHITELIST + "'"
+    result = pytesseract.image_to_string(crop, config=config6).strip()
+    if result:
+        print(f"ES OCR OK (PSM 6 fallback): '{result}'")
+        return result
+
+    print(f"ES OCR FAILED: all attempts returned empty "
+          f"(image size {page_image.size}, "
+          f"crop box {box})")
+    return ''
 
 
 def parse_easyship_items(raw_line):
@@ -1287,8 +1333,12 @@ def process_easyship(job_id, pdf_files, tmpdir):
                 n = len(plumb.pages)
             for pidx in range(n):
                 img = page_images[pidx] if pidx < len(page_images) else None
+                print(f"ES processing: {Path(path).name} page {pidx+1}/{n}")
                 raw_line = extract_easyship_raw_line(img)
                 raw_items = parse_easyship_items(raw_line)
+                if not raw_items:
+                    print(f"ES WARNING: no items parsed from page {pidx+1} "
+                          f"of {Path(path).name} — raw OCR was: '{raw_line}'")
                 items = []
                 for raw_sku, qty in raw_items:
                     canonical_sku, was_mapped = get_canonical_sku(raw_sku)
@@ -1565,6 +1615,351 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
         jobs[job_id]['pick_list'] = pick_list
 
 
+# ── EVRI DIRECT (Business Account) ────────────────────────────────────────────
+# Labels from the Evri direct business account.  PDF alternates:
+#   even pages (0, 2, 4, …) = shipping label  (283×425 pt, text layer)
+#   odd  pages (1, 3, 5, …) = packing slip    (283×425 pt, text layer)
+# We keep only the labels; SKU + qty come from the paired packing slip.
+
+# Stamp placement: top of the label, in the sender/logo area (y 0–40pt).
+# This region has the sender name ("M 4 Mart Limited") and EVRi logo — the
+# least-critical info for the packer.  No barcode overlap.
+ED_STAMP_TOP_PT = 2      # from top of page
+ED_STAMP_BOT_PT = 38     # from top of page
+ED_STAMP_LEFT_PT = 4
+ED_STAMP_RIGHT_PAD = 4   # from right edge
+
+
+def extract_evri_direct_items(plumb_page):
+    """Parse SKU + Qty from an Evri Direct packing-slip page using its text
+    layer (no OCR needed).  Returns [(raw_sku, qty_str), ...].
+
+    Layout (from pdfplumber word positions on sample):
+      "QtySKU" header at y≈131
+      Qty digit(s) at x≈14, y≈148+
+      SKU string at x≈28, y≈148+
+      Product name at x≈128, y≈148+
+
+    Some slips have no SKU code — only qty + product name.  Those return an
+    empty SKU string so the caller can handle them gracefully.
+    """
+    words = plumb_page.extract_words()
+    if not words:
+        return []
+
+    # Bucket words into rows (~3pt tolerance)
+    rows = {}
+    for w in words:
+        rows.setdefault(round(w['top'] / 3.0), []).append(w)
+
+    # Find the header row containing "QtySKU" or "Qty" to know where data starts
+    header_y = None
+    for key in sorted(rows):
+        row_text = ' '.join(w['text'] for w in rows[key]).lower()
+        if 'qty' in row_text and 'sku' in row_text:
+            header_y = key
+            break
+        if 'qtysku' in row_text.replace(' ', ''):
+            header_y = key
+            break
+
+    if header_y is None:
+        return []
+
+    items = []
+    for key in sorted(rows):
+        if key <= header_y:
+            continue  # skip everything up to and including the header
+
+        rw = sorted(rows[key], key=lambda w: w['x0'])
+        if not rw:
+            continue
+
+        # Skip rows that look like footer/total text
+        row_text = ' '.join(w['text'] for w in rw).strip()
+        if not row_text or row_text.lower().startswith('total'):
+            continue
+
+        # Parse: qty is the leftmost number (x < 28), SKU is text at 28 ≤ x < 128
+        qty_str = ''
+        sku_parts = []
+        for w in rw:
+            t = w['text'].strip()
+            x = w['x0']
+            if not t:
+                continue
+            if x < 28 and re.fullmatch(r'\d{1,4}', t):
+                qty_str = t
+            elif 28 <= x < 125:
+                sku_parts.append(t)
+            # x ≥ 125 is the product name column — we don't need it for SKU
+
+        sku = ' '.join(sku_parts).strip()
+        if qty_str:  # must have a qty to count as a real data row
+            items.append((sku, qty_str or '1'))
+
+    return items
+
+
+def create_evri_direct_overlay(items, page_w, page_h):
+    """Stamp SKU/Qty onto an Evri Direct label in the sender area at the top.
+    Similar to the 3rd-party overlay but positioned at the very top of the
+    label (the sender/logo region) instead of mid-label."""
+    packet = io.BytesIO()
+    c = canvas.Canvas(packet, pagesize=(page_w, page_h))
+    if not items:
+        c.save(); packet.seek(0); return packet
+
+    FONT = 'Helvetica-Bold'
+    bx0 = ED_STAMP_LEFT_PT
+    bx1 = page_w - ED_STAMP_RIGHT_PAD
+    bw = bx1 - bx0
+    # In PDF coordinates, y=0 is the bottom, so top of page = page_h
+    by_top = page_h - ED_STAMP_TOP_PT
+    by_bot = page_h - ED_STAMP_BOT_PT
+    band_h = by_top - by_bot
+
+    n = max(len(items), 1)
+    pad = 3.0
+
+    # Auto-shrink font to fit all items in the band
+    row_fs = 9.0
+    for fs in (9.0, 8.0, 7.5, 7.0, 6.5, 6.0, 5.5):
+        row_fs = fs
+        needed = pad + n * (fs + 2.5) + pad
+        if needed <= band_h:
+            break
+    lh = row_fs + 2.5
+
+    # Measure widths
+    def max_widths(fs):
+        msku = max((c.stringWidth(s, FONT, fs) for s, _ in items), default=40)
+        mqty = max((c.stringWidth(str(q), FONT, fs) for _, q in items), default=8)
+        return msku, mqty
+
+    msku, mqty = max_widths(row_fs)
+    gap = 10.0
+    while row_fs > 5.0 and (msku + gap + mqty + pad * 2) > bw:
+        row_fs -= 0.5
+        lh = row_fs + 2.5
+        msku, mqty = max_widths(row_fs)
+
+    th = min(pad + n * lh + pad, band_h)
+
+    # Draw background box
+    c.setLineWidth(0.8)
+    c.setFillColorRGB(1, 1, 1)  # white background to cover sender text
+    c.rect(bx0, by_top - th, bw, th, stroke=1, fill=1)
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont(FONT, row_fs)
+
+    ry = by_top - pad - row_fs
+    for s, q in items:
+        label = s if s else '(no SKU)'
+        c.drawString(bx0 + pad, ry, label)
+        c.drawRightString(bx1 - pad, ry, str(q))
+        ry -= lh
+
+    c.save()
+    packet.seek(0)
+    return packet
+
+
+def process_evri_direct(job_id, pdf_files, tmpdir):
+    """Job runner for the Evri Direct tab.
+
+    PDF structure: alternating pages — label (even index), packing slip (odd).
+    We extract SKU/qty from the packing slip text layer, check postcodes on
+    the label text layer, stamp labels, strip packing slips, sort by SKU,
+    and merge into one PDF with a pick-list page.
+    """
+    def update(progress, message):
+        with jobs_lock:
+            jobs[job_id]['progress'] = progress
+            jobs[job_id]['message'] = message
+
+    update(0, 'Reading Evri Direct labels...')
+    run_label = datetime.now(ZoneInfo('Europe/London')).strftime('%H%M')
+
+    # 1. Pair pages (label + packing slip) and extract data
+    page_entries = []
+    for path in pdf_files:
+        try:
+            with pdfplumber.open(path) as plumb:
+                num_pages = len(plumb.pages)
+                for pidx in range(0, num_pages, 2):  # step by 2: label at pidx, slip at pidx+1
+                    label_page = plumb.pages[pidx]
+
+                    # Extract SKU from paired packing slip (next page)
+                    raw_items = []
+                    if pidx + 1 < num_pages:
+                        slip_page = plumb.pages[pidx + 1]
+                        try:
+                            raw_items = extract_evri_direct_items(slip_page)
+                        except Exception as ex:
+                            print(f"Evri Direct: slip extraction failed page {pidx+1}: {ex}")
+
+                    # Map through canonical SKU system
+                    items = []
+                    for raw_sku, qty in raw_items:
+                        if raw_sku:
+                            canonical_sku, was_mapped = get_canonical_sku(raw_sku)
+                        else:
+                            canonical_sku = ''
+                            was_mapped = False
+                        it = {'sku': canonical_sku or '(no SKU)', 'qty': qty}
+                        if was_mapped:
+                            it['raw_sku'] = raw_sku
+                        items.append(it)
+
+                    # Extract postcode from label text layer (no OCR needed)
+                    try:
+                        label_text = label_page.extract_text() or ''
+                    except Exception:
+                        label_text = ''
+                    postcode_raw = extract_postcode_from_text(label_text)
+                    if postcode_raw:
+                        flagged, flag_reason = is_out_of_area(postcode_raw)
+                        postcode_info = {
+                            'postcode': postcode_raw,
+                            'flagged': flagged,
+                            'exclude': flagged,
+                            'reason': flag_reason if flagged else None
+                        }
+                    else:
+                        # No postcode found — flag for manual check
+                        postcode_info = {
+                            'postcode': None,
+                            'flagged': False,
+                            'exclude': True,
+                            'reason': 'Could not read postcode'
+                        }
+
+                    page_entries.append({
+                        'path': path, 'index': pidx, 'items': items,
+                        'postcode': postcode_info,
+                        'sort_key': items[0]['sku'].upper() if items else 'ZZZZ'
+                    })
+        except Exception as e:
+            page_entries.append({'path': path, 'index': 0, 'items': [], 'error': str(e),
+                                 'postcode': None, 'sort_key': 'ZZZZ'})
+
+    # 2. Split into included / excluded / error
+    error_entries = [e for e in page_entries if e.get('error')]
+    excluded_entries = [e for e in page_entries if not e.get('error') and e['postcode']['exclude']]
+    included_entries = [e for e in page_entries if not e.get('error') and not e['postcode']['exclude']]
+    total_labels = max(len(page_entries), 1)
+
+    update(35, 'Sorting by SKU...')
+    included_entries.sort(key=lambda e: e['sort_key'])
+
+    pick_list = build_pick_list(included_entries)
+
+    writer = PdfWriter()
+
+    # Peek the first included label's dimensions for the pick-list page
+    label_w, label_h = 283, 425
+    if included_entries:
+        try:
+            peek_reader = PdfReader(str(included_entries[0]['path']))
+            peek_page = peek_reader.pages[included_entries[0]['index']]
+            label_w = float(peek_page.mediabox.width)
+            label_h = float(peek_page.mediabox.height)
+        except Exception:
+            pass
+
+    if pick_list:
+        pick_list_buf = create_pick_list_page(pick_list, run_label, len(included_entries), label_w, label_h)
+        for pg in PdfReader(pick_list_buf).pages:
+            writer.add_page(pg)
+
+    results = []
+
+    # 3. Stamp only the label pages (no packing slips in output), in SKU order
+    for i, ent in enumerate(included_entries):
+        update(40 + int((i / max(len(included_entries), 1)) * 55),
+               'Stamping ' + str(i + 1) + '/' + str(len(included_entries)))
+        fname = Path(ent['path']).name
+        try:
+            reader = PdfReader(str(ent['path']))
+            page = reader.pages[ent['index']]  # the label page (even index)
+            pw = float(page.mediabox.width)
+            ph = float(page.mediabox.height)
+
+            if ent['items']:
+                overlay_rows = [(it['sku'], it['qty']) for it in ent['items']]
+                ov = create_evri_direct_overlay(overlay_rows, pw, ph)
+                page.merge_page(PdfReader(ov).pages[0])
+            writer.add_page(page)
+
+            has_sku = any(it['sku'] and it['sku'] != '(no SKU)' for it in ent['items'])
+            results.append({
+                'file': fname, 'status': 'ok',
+                'items': ent['items'] or [{'sku': '(no SKU)', 'qty': '?'}],
+                'order_id': '', 'page': i + 1, 'batch': run_label,
+                'carrier': 'Evri · Direct',
+                'needs_check': not has_sku,
+                'postcode': ent['postcode']['postcode'],
+                'warn_reason': None if has_sku else 'no SKU found on packing slip'
+            })
+        except Exception as e:
+            results.append({'file': fname, 'status': 'error', 'error': str(e),
+                            'needs_check': False, 'warn_reason': None})
+
+    # 4. Excluded / error entries — surfaced so user can cancel on Evri
+    for ent in excluded_entries:
+        fname = Path(ent['path']).name
+        pc = ent['postcode']
+        results.append({
+            'file': fname, 'status': 'excluded',
+            'items': ent['items'] or [{'sku': '(no SKU)', 'qty': '?'}],
+            'order_id': '', 'page': None, 'batch': '',
+            'carrier': 'Evri · Direct',
+            'needs_check': True,
+            'postcode': pc['postcode'],
+            'postcode_flagged': pc['flagged'],
+            'warn_reason': pc['reason']
+        })
+
+    for ent in error_entries:
+        fname = Path(ent['path']).name
+        results.append({'file': fname, 'status': 'error', 'error': ent['error'],
+                        'needs_check': False, 'warn_reason': None})
+
+    update(95, 'Saving PDF...')
+    out_path = os.path.join(tmpdir, 'labels_evri_direct_' + job_id + '.pdf')
+    with open(out_path, 'wb') as f:
+        writer.write(f)
+
+    ok_count = len([r for r in results if r['status'] == 'ok'])
+    warn_count = len([r for r in results if r['status'] == 'ok' and r.get('needs_check')])
+    out_of_area_count = len([r for r in results if r['status'] == 'excluded' and r.get('postcode_flagged')])
+    check_pc_count = len([r for r in results if r['status'] == 'excluded' and not r.get('postcode_flagged')])
+    ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
+    download_name = 'labels_evri_direct_' + ts + '.pdf'
+
+    with open(out_path, 'rb') as f:
+        save_label_file(job_id, 'evri_direct', run_label, download_name, f.read())
+    save_pick_list_entries(job_id, 'evri_direct', run_label, pick_list)
+
+    with jobs_lock:
+        jobs[job_id]['status'] = 'done'
+        jobs[job_id]['progress'] = 100
+        msg = str(ok_count) + '/' + str(total_labels) + ' Evri Direct labels processed'
+        if warn_count:
+            msg += ' — ⚠ ' + str(warn_count) + ' had no SKU'
+        if out_of_area_count:
+            msg += ' — 🚫 ' + str(out_of_area_count) + ' out of area'
+        if check_pc_count:
+            msg += ' — ⚠ ' + str(check_pc_count) + ' need postcode check'
+        jobs[job_id]['message'] = msg
+        jobs[job_id]['result_path'] = out_path
+        jobs[job_id]['results'] = results
+        jobs[job_id]['batch_id'] = run_label
+        jobs[job_id]['download_name'] = download_name
+        jobs[job_id]['pick_list'] = pick_list
+
+
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 
 @app.route('/')
@@ -1610,6 +2005,8 @@ def upload():
         target = process_thirdparty
     elif mode == 'easyship':
         target = process_easyship
+    elif mode == 'evri_direct':
+        target = process_evri_direct
     else:
         target = run_job
     t = threading.Thread(target=target, args=(job_id, pdf_files, tmpdir))
@@ -1780,6 +2177,85 @@ def _week_bounds(week_str):
     return monday, monday + timedelta(days=7)
 
 
+def _period_bounds(period, ref_date_str=None, from_str=None, to_str=None):
+    """Compute (start, end, label, prev_params, next_params) for a given period.
+    period: 'week' | 'fortnight' | 'month' | 'custom'
+    ref_date_str: 'YYYY-MM-DD' anchor date (Monday for week/fortnight, 1st for month)
+    from_str / to_str: 'YYYY-MM-DD' for custom range
+    Returns (start_dt, end_dt, label_str, prev_params_dict, next_params_dict)."""
+    tz = ZoneInfo('Europe/London')
+    now = datetime.now(tz)
+
+    if period == 'custom' and from_str and to_str:
+        try:
+            start = datetime.strptime(from_str, '%Y-%m-%d').replace(tzinfo=tz)
+            end = datetime.strptime(to_str, '%Y-%m-%d').replace(tzinfo=tz) + timedelta(days=1)
+        except Exception:
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=6)
+            end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        label = f"{start.strftime('%d %b %Y')} – {(end - timedelta(days=1)).strftime('%d %b %Y')}"
+        span = (end - start).days
+        prev_start = start - timedelta(days=span)
+        next_start = end
+        prev_p = {'period': 'custom', 'from': prev_start.strftime('%Y-%m-%d'),
+                  'to': (start - timedelta(days=1)).strftime('%Y-%m-%d')}
+        next_p = {'period': 'custom', 'from': next_start.strftime('%Y-%m-%d'),
+                  'to': (next_start + timedelta(days=span - 1)).strftime('%Y-%m-%d')}
+        return start, end, label, prev_p, next_p
+
+    if period == 'month':
+        if ref_date_str:
+            try:
+                ref = datetime.strptime(ref_date_str, '%Y-%m-%d').replace(tzinfo=tz)
+            except Exception:
+                ref = now
+        else:
+            ref = now
+        start = ref.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+        label = start.strftime('%B %Y')
+        if start.month == 1:
+            prev_start = start.replace(year=start.year - 1, month=12)
+        else:
+            prev_start = start.replace(month=start.month - 1)
+        if start.month == 12:
+            next_start = start.replace(year=start.year + 1, month=1)
+        else:
+            next_start = start.replace(month=start.month + 1)
+        prev_p = {'period': 'month', 'ref': prev_start.strftime('%Y-%m-%d')}
+        next_p = {'period': 'month', 'ref': next_start.strftime('%Y-%m-%d')}
+        return start, end, label, prev_p, next_p
+
+    if period == 'fortnight':
+        step = 14
+    else:
+        step = 7  # 'week' is the default
+
+    if ref_date_str:
+        try:
+            ref = datetime.strptime(ref_date_str, '%Y-%m-%d').replace(tzinfo=tz)
+        except Exception:
+            ref = now
+    else:
+        ref = now
+    # Snap to Monday
+    monday = ref - timedelta(days=ref.weekday())
+    monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = monday
+    end = monday + timedelta(days=step)
+    end_display = end - timedelta(days=1)
+    if step == 7:
+        label = f"Week of {start.strftime('%d %b %Y')} – {end_display.strftime('%d %b %Y')}"
+    else:
+        label = f"Fortnight: {start.strftime('%d %b %Y')} – {end_display.strftime('%d %b %Y')}"
+    prev_p = {'period': period, 'ref': (start - timedelta(days=step)).strftime('%Y-%m-%d')}
+    next_p = {'period': period, 'ref': end.strftime('%Y-%m-%d')}
+    return start, end, label, prev_p, next_p
+
+
 def _pick_list_totals_query(monday, next_monday, tab_filter):
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -1789,7 +2265,7 @@ def _pick_list_totals_query(monday, next_monday, tab_filter):
         WHERE created_at >= %s AND created_at < %s
     '''
     params = [monday, next_monday]
-    if tab_filter in ('amazon', 'thirdparty', 'easyship'):
+    if tab_filter in ('amazon', 'thirdparty', 'easyship', 'evri_direct'):
         query += ' AND tab = %s'
         params.append(tab_filter)
     query += ' GROUP BY sku ORDER BY total_qty DESC'
@@ -1803,59 +2279,123 @@ def _pick_list_totals_query(monday, next_monday, tab_filter):
 @app.route('/admin/pick-list-totals')
 @admin_required
 def pick_list_totals():
-    """Weekly totals across every pick list ever generated (Amazon Orders +
-    3rd-Party tabs), so you can see how many of each SKU actually went out
-    in a given week. Data comes from pick_list_entries, which is written
-    every time a batch finishes and is never auto-deleted."""
-    week_str = request.args.get('week', '')
+    """Totals across every pick list ever generated, with selectable period:
+    Week (Mon\u2013Sun), Fortnight (2 weeks), Month (calendar month), or Custom
+    date range. Data comes from pick_list_entries (3-month rolling retention)."""
+    period = request.args.get('period', 'week')
+    if period not in ('week', 'fortnight', 'month', 'custom'):
+        period = 'week'
     tab_filter = request.args.get('tab', 'all')
-    monday, next_monday = _week_bounds(week_str)
-    current_week_str = f'{monday.isocalendar()[0]}-W{monday.isocalendar()[1]:02d}'
-    prev_monday = monday - timedelta(days=7)
-    next_monday_nav = monday + timedelta(days=7)
-    prev_week_str = f'{prev_monday.isocalendar()[0]}-W{prev_monday.isocalendar()[1]:02d}'
-    next_week_str = f'{next_monday_nav.isocalendar()[0]}-W{next_monday_nav.isocalendar()[1]:02d}'
+    ref = request.args.get('ref', '')
+    from_d = request.args.get('from', '')
+    to_d = request.args.get('to', '')
+
+    # Also accept old ?week= param for backward compat
+    old_week = request.args.get('week', '')
+    if old_week and not ref:
+        try:
+            yr, wk = old_week.split('-W')
+            m = datetime.fromisocalendar(int(yr), int(wk), 1)
+            ref = m.strftime('%Y-%m-%d')
+        except Exception:
+            pass
+
+    start, end, period_label, prev_p, next_p = _period_bounds(period, ref, from_d, to_d)
 
     try:
-        rows = _pick_list_totals_query(monday, next_monday, tab_filter)
+        rows = _pick_list_totals_query(start, end, tab_filter)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+    # Check data retention \u2014 warn if range extends past oldest entry
+    retention_warn = ''
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT MIN(created_at) AS oldest FROM pick_list_entries')
+        oldest_row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if oldest_row and oldest_row['oldest']:
+            oldest = oldest_row['oldest']
+            if hasattr(oldest, 'tzinfo') and oldest.tzinfo is None:
+                oldest = oldest.replace(tzinfo=ZoneInfo('Europe/London'))
+            if start < oldest:
+                retention_warn = (f'<div style="background:#fef3c7;border:1px solid #f59e0b;'
+                                  f'padding:8px 12px;border-radius:4px;margin-bottom:1rem;'
+                                  f'font-size:13px;">\u26a0 Data retention is ~3 months. '
+                                  f'Oldest entry: {oldest.strftime("%d %b %Y")}. '
+                                  f'Totals before that date are incomplete.</div>')
+    except Exception:
+        pass
 
     total_units = sum(r['total_qty'] for r in rows)
     rows_html = ''.join(
         f'<tr><td>{esc_html(r["sku"])}</td><td>{r["total_qty"]}</td><td>{r["batches"]}</td></tr>'
         for r in rows
     )
-    week_label = f"{monday.strftime('%d %b %Y')} \u2013 {(next_monday - timedelta(days=1)).strftime('%d %b %Y')}"
+
+    def _qs(params):
+        parts = [f'{k}={v}' for k, v in params.items()]
+        parts.append(f'tab={tab_filter}')
+        return '&'.join(parts)
+
+    def _current_qs():
+        if period == 'custom':
+            return f'period=custom&from={start.strftime("%Y-%m-%d")}&to={(end - timedelta(days=1)).strftime("%Y-%m-%d")}&tab={tab_filter}'
+        elif period == 'month':
+            return f'period=month&ref={start.strftime("%Y-%m-%d")}&tab={tab_filter}'
+        else:
+            return f'period={period}&ref={start.strftime("%Y-%m-%d")}&tab={tab_filter}'
+
+    def period_link(p, label):
+        bold = ' style="font-weight:bold;text-decoration:underline;"' if period == p else ''
+        return f'<a href="/admin/pick-list-totals?period={p}&tab={tab_filter}"{bold}>{label}</a>'
 
     def tab_link(t, label):
         style = ' style="font-weight:bold;text-decoration:underline;"' if tab_filter == t else ''
-        return f'<a href="/admin/pick-list-totals?week={current_week_str}&tab={t}"{style}>{label}</a>'
+        return f'<a href="/admin/pick-list-totals?{_current_qs().replace("tab=" + tab_filter, "tab=" + t)}"{style}>{label}</a>'
+
+    period_word = {'week': 'week', 'fortnight': 'fortnight', 'month': 'month', 'custom': 'period'}[period]
 
     return f'''<!DOCTYPE html>
     <html><head><title>Pick List Totals</title>
     <style>
       body {{ font-family: sans-serif; background: #f5f4f0; margin: 0; padding: 2rem; }}
       h1 {{ font-size: 1.4rem; margin-bottom: 0.5rem; }}
-      .sub {{ color: #666; font-size: 13px; margin-bottom: 1.5rem; }}
+      .sub {{ color: #666; font-size: 13px; margin-bottom: 1rem; }}
       table {{ border-collapse: collapse; width: 100%; max-width: 640px; background: #fff; }}
       th, td {{ text-align: left; padding: 8px 12px; border-bottom: 1px solid #e5e3de; font-size: 14px; }}
       th {{ background: #efece5; }}
-      .nav a, .tabs a {{ margin-right: 16px; color: #2563eb; text-decoration: none; }}
-      .nav a:hover, .tabs a:hover {{ text-decoration: underline; }}
+      .nav a, .tabs a, .periods a {{ margin-right: 16px; color: #2563eb; text-decoration: none; font-size: 14px; }}
+      .nav a:hover, .tabs a:hover, .periods a:hover {{ text-decoration: underline; }}
       .total-row td {{ font-weight: bold; border-top: 2px solid #333; }}
+      .custom-form {{ display: inline; font-size: 13px; }}
+      .custom-form input[type=date] {{ font-size: 13px; padding: 2px 4px; }}
+      .custom-form button {{ font-size: 13px; padding: 2px 8px; cursor: pointer; }}
     </style></head>
     <body>
-      <h1>Pick List Totals \u2014 week of {week_label}</h1>
-      <div class="sub">{total_units} total units across {len(rows)} SKUs this week</div>
-      <div class="nav">
-        <a href="/admin/pick-list-totals?week={prev_week_str}&tab={tab_filter}">&larr; Previous week</a>
-        <a href="/admin/pick-list-totals?week={current_week_str}&tab={tab_filter}">This week</a>
-        <a href="/admin/pick-list-totals?week={next_week_str}&tab={tab_filter}">Next week &rarr;</a>
+      <h1>Pick List Totals \u2014 {period_label}</h1>
+      <div class="sub">{total_units} total units across {len(rows)} SKUs this {period_word}</div>
+      <div class="periods" style="margin-bottom:0.5rem;">
+        {period_link('week', 'Week')} {period_link('fortnight', 'Fortnight')} {period_link('month', 'Month')}
+        <form class="custom-form" method="get" action="/admin/pick-list-totals">
+          <input type="hidden" name="period" value="custom">
+          <input type="hidden" name="tab" value="{tab_filter}">
+          From <input type="date" name="from" value="{from_d or start.strftime('%Y-%m-%d')}">
+          to <input type="date" name="to" value="{to_d or (end - timedelta(days=1)).strftime('%Y-%m-%d')}">
+          <button type="submit">Go</button>
+        </form>
       </div>
+      <div class="nav">
+        <a href="/admin/pick-list-totals?{_qs(prev_p)}">&larr; Previous {period_word}</a>
+        <a href="/admin/pick-list-totals?period={period}&tab={tab_filter}">Current {period_word}</a>
+        <a href="/admin/pick-list-totals?{_qs(next_p)}">Next {period_word} &rarr;</a>
+      </div>
+      {retention_warn}
       <div class="tabs" style="margin-bottom:1rem;">
-        {tab_link('all', 'All')} {tab_link('amazon', 'Amazon Orders')} {tab_link('thirdparty', '3rd-Party')} {tab_link('easyship', 'Easy Ship')}
-        &nbsp;|&nbsp; <a href="/admin/pick-list-totals.csv?week={current_week_str}&tab={tab_filter}">Download CSV</a>
+        {tab_link('all', 'All')} {tab_link('amazon', 'Amazon Orders')} {tab_link('thirdparty', '3rd-Party')} {tab_link('easyship', 'Easy Ship')} {tab_link('evri_direct', 'Evri Direct')}
+        &nbsp;|&nbsp; <a href="/admin/pick-list-totals.csv?{_current_qs()}">Download CSV</a>
       </div>
       <table>
         <tr><th>SKU</th><th>Total Qty</th><th>Batches</th></tr>
@@ -1869,23 +2409,39 @@ def pick_list_totals():
 @app.route('/admin/pick-list-totals.csv')
 @admin_required
 def pick_list_totals_csv():
-    week_str = request.args.get('week', '')
+    period = request.args.get('period', 'week')
+    if period not in ('week', 'fortnight', 'month', 'custom'):
+        period = 'week'
     tab_filter = request.args.get('tab', 'all')
-    monday, next_monday = _week_bounds(week_str)
+    ref = request.args.get('ref', '')
+    from_d = request.args.get('from', '')
+    to_d = request.args.get('to', '')
+
+    # Backward compat with old ?week= param
+    old_week = request.args.get('week', '')
+    if old_week and not ref:
+        try:
+            yr, wk = old_week.split('-W')
+            m = datetime.fromisocalendar(int(yr), int(wk), 1)
+            ref = m.strftime('%Y-%m-%d')
+        except Exception:
+            pass
+
+    start, end, period_label, _, _ = _period_bounds(period, ref, from_d, to_d)
 
     try:
-        rows = _pick_list_totals_query(monday, next_monday, tab_filter)
+        rows = _pick_list_totals_query(start, end, tab_filter)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
     output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(['sku', 'total_qty', 'batches'])
+    w = csv.writer(output)
+    w.writerow(['sku', 'total_qty', 'batches'])
     for r in rows:
-        writer.writerow([r['sku'], r['total_qty'], r['batches']])
+        w.writerow([r['sku'], r['total_qty'], r['batches']])
 
-    iso = monday.isocalendar()
-    fname = f'pick_list_totals_{iso[0]}-W{iso[1]:02d}.csv'
+    date_part = f'{start.strftime("%Y%m%d")}-{(end - timedelta(days=1)).strftime("%Y%m%d")}'
+    fname = f'pick_list_totals_{period}_{date_part}.csv'
     return Response(
         output.getvalue(),
         mimetype='text/csv',
