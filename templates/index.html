@@ -211,14 +211,17 @@
   <div class="card" id="template-section" style="display:none;">
     <div class="card-title">Mirakl Tracking Templates <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);">— for shipment confirmation uploads</span></div>
     <div id="template-status" style="font-size:12px;color:var(--muted);margin-bottom:0.75rem;">Loading...</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;">
-      <div style="flex:1;min-width:200px;">
-        <div style="font-size:12px;font-weight:600;margin-bottom:4px;">Tesco Template (.xlsx)</div>
-        <input type="file" id="tpl-tesco" accept=".xlsx" style="font-size:12px;" onchange="uploadTemplate('tesco', this)">
-      </div>
-      <div style="flex:1;min-width:200px;">
-        <div style="font-size:12px;font-weight:600;margin-bottom:4px;">B&Q Template (.xlsx)</div>
-        <input type="file" id="tpl-bnq" accept=".xlsx" style="font-size:12px;" onchange="uploadTemplate('bnq', this)">
+    <div id="template-override" style="display:none;">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">Override built-in templates (only needed if Mirakl changes their format):</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <div style="flex:1;min-width:200px;">
+          <div style="font-size:12px;font-weight:600;margin-bottom:4px;">Tesco Template (.xlsx)</div>
+          <input type="file" id="tpl-tesco" accept=".xlsx" style="font-size:12px;" onchange="uploadTemplate('tesco', this)">
+        </div>
+        <div style="flex:1;min-width:200px;">
+          <div style="font-size:12px;font-weight:600;margin-bottom:4px;">B&Q Template (.xlsx)</div>
+          <input type="file" id="tpl-bnq" accept=".xlsx" style="font-size:12px;" onchange="uploadTemplate('bnq', this)">
+        </div>
       </div>
     </div>
   </div>
@@ -539,15 +542,16 @@ async function loadTemplateStatus() {
   try {
     const res = await fetch('/tracking-templates');
     const templates = await res.json();
-    if (!templates.length) {
-      el.innerHTML = 'No templates uploaded yet. Upload the Mirakl tracking template XLSX files below — these are used when generating tracking uploads.';
-      return;
+    let badges = '<span style="display:inline-block;background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px;">Tesco — built-in ✓</span>';
+    badges += '<span style="display:inline-block;background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px;">B&Q — built-in ✓</span>';
+    if (templates.length) {
+      badges = templates.map(t => {
+        const date = new Date(t.uploaded_at).toLocaleDateString('en-GB', {day:'2-digit',month:'short',year:'numeric'});
+        return `<span style="display:inline-block;background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px;">${t.marketplace === 'bnq' ? 'B&Q' : 'Tesco'} — custom override ${date}</span>`;
+      }).join('');
     }
-    el.innerHTML = templates.map(t => {
-      const date = new Date(t.uploaded_at).toLocaleDateString('en-GB', {day:'2-digit',month:'short',year:'numeric'});
-      return `<span style="display:inline-block;background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px;">${t.marketplace === 'bnq' ? 'B&Q' : 'Tesco'} — uploaded ${date} (${(t.size/1024).toFixed(1)}KB)</span>`;
-    }).join('');
-  } catch(e) { el.textContent = 'Could not load template status.'; }
+    el.innerHTML = badges;
+  } catch(e) { el.textContent = 'Templates: built-in ✓'; }
 }
 
 async function uploadTemplate(marketplace, input) {
