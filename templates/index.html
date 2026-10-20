@@ -624,7 +624,7 @@ function showResults(data) {
   if (trackingFiles.length) {
     let html = trackingFiles.map(tf => {
       const label = tf.channel === 'tesco' ? 'Tesco' : 'B&Q';
-      const ext = tf.channel === 'tesco' ? '.xlsx' : '.csv';
+      const ext = tf.filename && tf.filename.endsWith('.xlsx') ? '.xlsx' : '.csv';
       return `<div class="tracking-row">
         <span class="track-channel">📦 ${label}</span>
         <span class="track-count">${tf.count} order${tf.count !== 1 ? 's' : ''}</span>
@@ -633,6 +633,13 @@ function showResults(data) {
     }).join('');
     if (trackingSummary.skipped_dup) {
       html += `<div class="tracking-dup">ℹ ${trackingSummary.skipped_dup} order${trackingSummary.skipped_dup !== 1 ? 's' : ''} already uploaded — skipped</div>`;
+    }
+    if (trackingSummary.skipped_unknown) {
+      let unknownMsg = `⚠ ${trackingSummary.skipped_unknown} label${trackingSummary.skipped_unknown !== 1 ? 's' : ''} had unrecognised order ID format — skipped`;
+      if (trackingSummary.unknown_ids && trackingSummary.unknown_ids.length) {
+        unknownMsg += ` (e.g. ${trackingSummary.unknown_ids.join(', ')})`;
+      }
+      html += `<div class="tracking-dup">${unknownMsg}</div>`;
     }
     if (trackingSummary.no_tracking) {
       html += `<div class="tracking-dup">⚠ ${trackingSummary.no_tracking} label${trackingSummary.no_tracking !== 1 ? 's' : ''} had no tracking data</div>`;
