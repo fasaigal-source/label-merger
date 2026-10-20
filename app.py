@@ -124,6 +124,26 @@ def init_db():
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
         ''')
+        # Mirakl tracking XLSX templates (one per marketplace)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS tracking_templates (
+                marketplace TEXT PRIMARY KEY,
+                template_data BYTEA NOT NULL,
+                uploaded_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS sku_dimensions (
+                sku TEXT PRIMARY KEY,
+                weight_kg NUMERIC(6,2) NOT NULL DEFAULT 0,
+                length_cm NUMERIC(6,1) NOT NULL DEFAULT 0,
+                width_cm NUMERIC(6,1) NOT NULL DEFAULT 0,
+                height_cm NUMERIC(6,1) NOT NULL DEFAULT 0,
+                item_name TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        ''')
         conn.commit()
         cur.close()
         conn.close()
@@ -1794,100 +1814,161 @@ def save_tracking_file(job_id, channel, filename, file_data, order_count):
         print(f"Save tracking file error: {e}")
 
 
+def _build_mirakl_tracking_xlsx(template_bytes, orders, carrier_key_prefix):
+    """Build a Mirakl-compatible tracking XLSX by injecting data rows into the
+    official Mirakl template.  This preserves all the template's XML structure
+    (data validations, frozen panes, inline-string format, styles) which Mirakl's
+    importer is strict about.
+
+    template_bytes: the raw bytes of the downloaded Mirakl tracking template .xlsx
+    orders: list of dicts with keys order_id, tracking_number, carrier
+    carrier_key_prefix: 'tesco' or 'bnq' — selects carrier dict keys
+    Returns the finished XLSX as bytes.
+    """
+    import zipfile as _zf
+    from xml.sax.saxutils import escape as xml_esc
+
+    COL_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F']
+
+    # Build data rows XML (inline strings, style s="0" = normal)
+    data_rows_xml = ''
+    for idx, o in enumerate(orders, 3):
+        carrier = o['carrier']
+        tn = o['tracking_number']
+        url = carrier['url_template'].format(tn=tn)
+        vals = [
+            o['order_id'],
+            carrier[f'{carrier_key_prefix}_code'],
+            carrier[f'{carrier_key_prefix}_standard_code'],
+            carrier[f'{carrier_key_prefix}_name'],
+            url,
+            tn,
+        ]
+        cells = ''
+        for ci, val in enumerate(vals):
+            cells += f'<c r="{COL_LETTERS[ci]}{idx}" t="inlineStr"><is><t>{xml_esc(str(val))}</t></is></c>'
+        data_rows_xml += f'<row r="{idx}">{cells}</row>\n'
+
+    # Read the template, patch sheet1 with data rows, write new XLSX
+    in_zip = _zf.ZipFile(io.BytesIO(template_bytes), 'r')
+    out_buf = io.BytesIO()
+    out_zip = _zf.ZipFile(out_buf, 'w', _zf.ZIP_DEFLATED)
+
+    for item in in_zip.infolist():
+        raw = in_zip.read(item.filename)
+        if item.filename == 'xl/worksheets/sheet1.xml':
+            xml_str = raw.decode('utf-8')
+            # Update dimension
+            last_row = 2 + len(orders)
+            xml_str = re.sub(r'<dimension ref="A1:F\d+"/>', f'<dimension ref="A1:F{last_row}"/>', xml_str)
+            # Insert data rows after the header rows (before </sheetData>)
+            xml_str = xml_str.replace('</sheetData>', data_rows_xml + '</sheetData>')
+            raw = xml_str.encode('utf-8')
+        out_zip.writestr(item, raw)
+
+    in_zip.close()
+    out_zip.close()
+    return out_buf.getvalue()
+
+
+# ── Embedded Mirakl tracking templates ──
+# These are the official Mirakl XLSX templates downloaded from the marketplace.
+# Stored as base64 to keep app.py self-contained.
+import base64 as _b64
+
+def _load_tracking_template(marketplace):
+    """Load the Mirakl tracking template for the given marketplace from the DB,
+    falling back to a minimal built-in template if not stored."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT template_data FROM tracking_templates WHERE marketplace = %s", (marketplace,))
+        row = cur.fetchone()
+        if row:
+            return bytes(row[0])
+    except Exception:
+        pass
+    # Return None — caller will use fallback CSV approach
+    return None
+
+
 def generate_tesco_tracking_xlsx(orders, job_id):
-    """Generate Tesco Marketplace tracking upload XLSX.
+    """Generate Tesco Marketplace tracking upload XLSX using the Mirakl template.
     orders: list of dicts with keys: order_id, tracking_number, carrier (resolved carrier dict).
     Returns (filename, bytes) or None if no orders.
     """
     if not orders:
         return None
-    wb = Workbook()
 
-    # ── Data sheet ──
-    ws = wb.active
-    ws.title = 'Data'
-    font_bold = Font(name='Calibri', size=11, bold=True)
-    font_normal = Font(name='Calibri', size=11, bold=False)
-
-    # Row 1: display headers (bold)
-    display_headers = ['Order number', 'Carrier Code', 'Carrier standard code',
-                       'Carrier Name', 'Carrier URL', 'Tracking number']
-    for col_idx, hdr in enumerate(display_headers, 1):
-        cell = ws.cell(row=1, column=col_idx, value=hdr)
-        cell.font = font_bold
-
-    # Row 2: field keys (bold)
-    field_keys = ['order-id', 'carrier-code', 'carrier-standard-code',
-                  'carrier-name', 'carrier-url', 'tracking-number']
-    for col_idx, key in enumerate(field_keys, 1):
-        cell = ws.cell(row=2, column=col_idx, value=key)
-        cell.font = font_bold
-
-    # Data rows from row 3 (non-bold)
-    for row_idx, o in enumerate(orders, 3):
-        carrier = o['carrier']
-        tn = o['tracking_number']
-        url = carrier['url_template'].format(tn=tn)
-        row_data = [
-            o['order_id'],
-            carrier['tesco_code'],
-            carrier['tesco_standard_code'],
-            carrier['tesco_name'],
-            url,
-            tn,
-        ]
-        for col_idx, val in enumerate(row_data, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.font = font_normal
-
-    # ── ReferenceData sheet ──
-    ws_ref = wb.create_sheet('ReferenceData')
-    ws_ref.cell(row=1, column=1, value='carrier-code').font = font_bold
-    for ri, cname in enumerate(['Evri', 'Royal Mail'], 2):
-        ws_ref.cell(row=ri, column=1, value=cname).font = font_normal
-
-    # Save to bytes
-    buf = io.BytesIO()
-    wb.save(buf)
-    file_bytes = buf.getvalue()
+    template = _load_tracking_template('tesco')
+    if template:
+        file_bytes = _build_mirakl_tracking_xlsx(template, orders, 'tesco')
+    else:
+        # Fallback: use openpyxl (may not be accepted by Mirakl's strict parser)
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'Data'
+        font_bold = Font(name='Calibri', size=11, bold=True)
+        font_normal = Font(name='Calibri', size=11, bold=False)
+        display_headers = ['Order number', 'Carrier Code', 'Carrier standard code',
+                           'Carrier Name', 'Carrier URL', 'Tracking number']
+        for col_idx, hdr in enumerate(display_headers, 1):
+            ws.cell(row=1, column=col_idx, value=hdr).font = font_bold
+        field_keys = ['order-id', 'carrier-code', 'carrier-standard-code',
+                      'carrier-name', 'carrier-url', 'tracking-number']
+        for col_idx, key in enumerate(field_keys, 1):
+            ws.cell(row=2, column=col_idx, value=key).font = font_bold
+        for row_idx, o in enumerate(orders, 3):
+            carrier = o['carrier']
+            tn = o['tracking_number']
+            url = carrier['url_template'].format(tn=tn)
+            for col_idx, val in enumerate([o['order_id'], carrier['tesco_code'],
+                carrier['tesco_standard_code'], carrier['tesco_name'], url, tn], 1):
+                ws.cell(row=row_idx, column=col_idx, value=val).font = font_normal
+        ws_ref = wb.create_sheet('ReferenceData')
+        ws_ref.cell(row=1, column=1, value='carrier-code').font = font_bold
+        for ri, cname in enumerate(['Evri', 'Royal Mail'], 2):
+            ws_ref.cell(row=ri, column=1, value=cname).font = font_normal
+        buf = io.BytesIO()
+        wb.save(buf)
+        file_bytes = buf.getvalue()
 
     ts = datetime.now().strftime('%d-%b-%Y').lower()
     filename = f'tesco-tracking-upload-{ts}.xlsx'
-
     save_tracking_file(job_id, 'tesco', filename, file_bytes, len(orders))
     return filename, file_bytes
 
 
-def generate_bnq_tracking_csv(orders, job_id):
-    """Generate B&Q Marketplace tracking upload CSV (semicolon-delimited).
-    orders: list of dicts with keys: order_id, tracking_number, carrier (resolved carrier dict).
+def generate_bnq_tracking_xlsx(orders, job_id):
+    """Generate B&Q Marketplace tracking upload XLSX using the Mirakl template.
+    Falls back to semicolon CSV if no template is stored.
     Returns (filename, bytes) or None if no orders.
     """
     if not orders:
         return None
 
+    template = _load_tracking_template('bnq')
+    if template:
+        file_bytes = _build_mirakl_tracking_xlsx(template, orders, 'bnq')
+        ts = datetime.now().strftime('%d-%b-%Y').lower()
+        filename = f'bnq-tracking-upload-{ts}.xlsx'
+        save_tracking_file(job_id, 'bnq', filename, file_bytes, len(orders))
+        return filename, file_bytes
+
+    # Fallback: semicolon-delimited CSV
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=';', quoting=csv.QUOTE_NONE)
     writer.writerow(['order-id', 'carrier-code', 'carrier-standard-code',
                      'carrier-name', 'carrier-url', 'tracking-number'])
-
     for o in orders:
         carrier = o['carrier']
         tn = o['tracking_number']
         url = carrier['url_template'].format(tn=tn)
-        writer.writerow([
-            o['order_id'],
-            carrier['bnq_code'],
-            carrier['bnq_standard_code'],
-            carrier['bnq_name'],
-            url,
-            tn,
-        ])
-
+        writer.writerow([o['order_id'], carrier['bnq_code'],
+            carrier['bnq_standard_code'], carrier['bnq_name'], url, tn])
     file_bytes = buf.getvalue().encode('utf-8')
     ts = datetime.now().strftime('%d-%b-%Y').lower()
     filename = f'bnq-tracking-upload-{ts}.csv'
-
     save_tracking_file(job_id, 'bnq', filename, file_bytes, len(orders))
     return filename, file_bytes
 
@@ -2275,7 +2356,7 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
                 })
 
         if bnq_orders:
-            result = generate_bnq_tracking_csv(bnq_orders, job_id)
+            result = generate_bnq_tracking_xlsx(bnq_orders, job_id)
             if result:
                 tracking_summary['bnq'] = len(bnq_orders)
                 tracking_summary['bnq_file'] = result[0]
@@ -2421,18 +2502,133 @@ def download_tracking(job_id, channel):
     if not row:
         return jsonify({'error': 'Tracking file not found'}), 404
     filename, file_data = row
-    if channel == 'tesco':
+    if filename.endswith('.xlsx'):
         mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     else:
         mime = 'text/csv'
     return send_file(io.BytesIO(bytes(file_data)), as_attachment=True,
                      download_name=filename, mimetype=mime)
 
-# ── MIRAKL → EVRI CONVERTER ─────────────────────────────────────────────────
+# ── SKU DIMENSIONS LOOKUP ────────────────────────────────────────────────────
 
-# SKU → weight mapping (kg) – used when the Mirakl export has no Weight column.
-# Updated via the converter UI; persisted per-session for now.
-SKU_WEIGHT_MAP = {}
+def get_sku_dimensions_map():
+    """Load all SKU → dimensions from the DB into a dict."""
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT sku, weight_kg, length_cm, width_cm, height_cm, item_name FROM sku_dimensions ORDER BY sku')
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return {r['sku']: r for r in rows}
+    except Exception:
+        return {}
+
+
+@app.route('/sku-dimensions', methods=['GET'])
+def list_sku_dimensions():
+    """Return all SKU dimension entries."""
+    dims = get_sku_dimensions_map()
+    return jsonify(list(dims.values()))
+
+
+@app.route('/sku-dimensions', methods=['POST'])
+def save_sku_dimension():
+    """Create or update a single SKU dimension entry."""
+    data = request.get_json()
+    if not data or not data.get('sku'):
+        return jsonify({'error': 'SKU is required'}), 400
+    sku = data['sku'].strip()
+    weight = float(data.get('weight_kg', 0) or 0)
+    length = float(data.get('length_cm', 0) or 0)
+    width = float(data.get('width_cm', 0) or 0)
+    height = float(data.get('height_cm', 0) or 0)
+    item_name = data.get('item_name', '').strip()
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO sku_dimensions (sku, weight_kg, length_cm, width_cm, height_cm, item_name, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (sku) DO UPDATE SET
+                weight_kg = EXCLUDED.weight_kg,
+                length_cm = EXCLUDED.length_cm,
+                width_cm = EXCLUDED.width_cm,
+                height_cm = EXCLUDED.height_cm,
+                item_name = EXCLUDED.item_name,
+                updated_at = NOW()
+        ''', (sku, weight, length, width, height, item_name))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'sku': sku})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/sku-dimensions/<sku>', methods=['DELETE'])
+def delete_sku_dimension(sku):
+    """Delete a SKU dimension entry."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM sku_dimensions WHERE sku = %s', (sku,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/tracking-template', methods=['POST'])
+def upload_tracking_template():
+    """Upload a Mirakl tracking XLSX template for Tesco or B&Q.
+    The template is stored in the DB and used when generating tracking files.
+    """
+    marketplace = request.form.get('marketplace', '').strip().lower()
+    if marketplace not in ('tesco', 'bnq'):
+        return jsonify({'error': 'marketplace must be tesco or bnq'}), 400
+    f = request.files.get('file')
+    if not f:
+        return jsonify({'error': 'No file uploaded'}), 400
+    file_data = f.read()
+    if not file_data:
+        return jsonify({'error': 'Empty file'}), 400
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO tracking_templates (marketplace, template_data, uploaded_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (marketplace) DO UPDATE SET
+                template_data = EXCLUDED.template_data,
+                uploaded_at = NOW()
+        ''', (marketplace, file_data))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'marketplace': marketplace, 'size': len(file_data)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/tracking-templates', methods=['GET'])
+def list_tracking_templates():
+    """List which tracking templates have been uploaded."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT marketplace, uploaded_at, length(template_data) as size FROM tracking_templates ORDER BY marketplace")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify([dict(r) for r in rows])
+    except Exception:
+        return jsonify([])
+
+
+# ── MIRAKL → EVRI CONVERTER ─────────────────────────────────────────────────
 
 def parse_mirakl_csv(file_data):
     """Parse a Mirakl order export CSV (Tesco or B&Q).
@@ -2472,39 +2668,113 @@ def extract_item_name(details_str):
     return details_str.strip().strip('"')
 
 
-def get_weight_kg(row, marketplace):
-    """Get weight in Kg from a Mirakl order row.
-    Tesco orders_5 has 'Weight' in grams.  Others may not have it.
-    Falls back to SKU_WEIGHT_MAP, then to a sensible default.
+def get_sku_dims(row, marketplace, dims_map):
+    """Get weight (kg) and dimensions (cm) from the DB lookup, falling back to
+    the Mirakl Weight column (grams) if no DB entry exists.
+    Returns (weight_kg, length_cm, width_cm, height_cm, source).
+    source is 'db', 'mirakl', or 'missing'.
     """
-    # Try the Weight column (Tesco variant with gram values)
+    sku = row.get('Seller SKU', row.get('Shop SKU', '')).strip()
+
+    # Priority 1: DB lookup by SKU
+    if sku and sku in dims_map:
+        d = dims_map[sku]
+        return (float(d['weight_kg']), float(d['length_cm']),
+                float(d['width_cm']), float(d['height_cm']), 'db')
+
+    # Priority 2: Mirakl Weight column (Tesco variant, value in grams)
     w = row.get('Weight', '').strip()
     if w and w.replace('.', '', 1).isdigit():
         grams = float(w)
-        if grams > 100:
-            # Value is in grams — convert to kg
-            return round(grams / 1000, 2)
-        else:
-            # Already in kg
-            return round(grams, 2)
+        weight_kg = round(grams / 1000, 2) if grams > 100 else round(grams, 2)
+        return (weight_kg, 0, 0, 0, 'mirakl')
 
-    # Fall back to SKU weight map
-    sku = row.get('Seller SKU', row.get('Shop SKU', '')).strip()
-    if sku and sku in SKU_WEIGHT_MAP:
-        return SKU_WEIGHT_MAP[sku]
+    # No data available
+    return (0, 0, 0, 0, 'missing')
 
-    # Default: 2kg (typical pillow shipment)
-    return 2.0
+
+_STREET_SUFFIXES = re.compile(
+    r'\b(Street|Road|Lane|Drive|Avenue|Close|Way|Place|Crescent|Terrace|'
+    r'Gardens?|Park|Court|Walk|Rise|Grove|Hill|Mews|Row|Square|Parade|'
+    r'Circus|View|Gate|End|Green|Fields?|Meadow|Path|Track|'
+    r'St|Rd|Ln|Dr|Ave|Cl|Ct|Pl|Cres|Gr|Pk)\b',
+    re.IGNORECASE
+)
+
+def split_address(street1, street2):
+    """Split a Mirakl 'Shipping address street 1' into (property, street).
+    Evri wants house name/number in Property and the street name in Street.
+
+    Examples:
+      '11 Riverside Park'                          → ('11', 'Riverside Park')
+      'Flat B 85 Corbyn Street'                    → ('Flat B 85', 'Corbyn Street')
+      'Chestnut House, Wind Whistle Lane'          → ('Chestnut House', 'Wind Whistle Lane')
+      'Flat 6, Alfred Dellar Court, Minnis Road'   → ('Flat 6, Alfred Dellar Court', 'Minnis Road')
+    """
+    if not street1:
+        return ('', street2 or '')
+
+    s1 = street1.strip()
+
+    # If street2 is populated, use street1 as Property and street2 as Street
+    if street2 and street2.strip():
+        return (s1, street2.strip())
+
+    # Strategy 1: If there's a comma, split on the LAST comma.
+    # "Chestnut House, Wind Whistle Lane" → prop="Chestnut House", street="Wind Whistle Lane"
+    # "Flat 6, Alfred Dellar Court, Minnis Road" → prop="Flat 6, Alfred Dellar Court", street="Minnis Road"
+    if ',' in s1:
+        last_comma = s1.rfind(',')
+        prop = s1[:last_comma].strip()
+        street = s1[last_comma + 1:].strip()
+        if prop and street:
+            return (prop, street)
+
+    # Strategy 2: Find the last street-type suffix word and split before its
+    # accompanying street name.  E.g. "Flat B 85 Corbyn Street" → find "Street",
+    # then include the word before it ("Corbyn") as part of the street name.
+    matches = list(_STREET_SUFFIXES.finditer(s1))
+    if matches:
+        last_match = matches[-1]
+        # Walk backwards from the suffix to find where the street name starts.
+        # The street name is typically the word(s) before the suffix.
+        before = s1[:last_match.start()].rstrip()
+        suffix_and_after = s1[last_match.start():]
+        if before:
+            # Find the last "word boundary" — the street name word before the suffix
+            # E.g. "Flat B 85 Corbyn" → last word is "Corbyn"
+            parts = before.rsplit(None, 1)
+            if len(parts) == 2:
+                prop = parts[0].strip()
+                street = parts[1] + ' ' + suffix_and_after.strip()
+                return (prop, street)
+            else:
+                # Only one word before suffix — it's all street, no property
+                return ('', s1)
+
+    # Strategy 3: If it starts with a number, split after the leading number/letter group.
+    # "27 Mickleton Close" → ('27', 'Mickleton Close')
+    m = re.match(r'^(\d+\w?)\s+(.+)$', s1)
+    if m:
+        return (m.group(1), m.group(2))
+
+    # Fallback: everything in Property
+    return (s1, '')
 
 
 def mirakl_to_evri_rows(orders, marketplace):
     """Convert parsed Mirakl orders to Evri CSV rows.
-    Returns (evri_rows, zone_b_orders, stats_dict).
+    Returns (evri_rows, zone_b_orders, missing_skus, stats_dict).
     Each evri_row is a dict matching Evri column headers.
     """
+    # Load SKU dimensions from DB
+    dims_map = get_sku_dimensions_map()
+
     evri_rows = []
     zone_b_orders = []
-    stats = {'total': len(orders), 'converted': 0, 'zone_b': 0, 'skipped': 0}
+    missing_skus = {}  # sku → item_name for SKUs with no dimensions in DB
+    stats = {'total': len(orders), 'converted': 0, 'zone_b': 0, 'skipped': 0,
+             'dims_from_db': 0, 'dims_from_mirakl': 0, 'dims_missing': 0}
 
     for row in orders:
         order_num = row.get('Order number', '').strip()
@@ -2516,14 +2786,24 @@ def mirakl_to_evri_rows(orders, marketplace):
         # Value — order amount
         value = row.get('Amount', '0').strip()
 
-        # Weight
-        weight_kg = get_weight_kg(row, marketplace)
-
         # SKU
         if marketplace == 'bnq':
             sku = row.get('Shop SKU', '').strip()
         else:
             sku = row.get('Seller SKU', '').strip()
+
+        # Weight & dimensions from DB lookup or Mirakl fallback
+        weight_kg, length_cm, width_cm, height_cm, dims_source = get_sku_dims(row, marketplace, dims_map)
+        if dims_source == 'db':
+            stats['dims_from_db'] += 1
+        elif dims_source == 'mirakl':
+            stats['dims_from_mirakl'] += 1
+            if sku and sku not in missing_skus:
+                missing_skus[sku] = item_name[:60]
+        else:
+            stats['dims_missing'] += 1
+            if sku and sku not in missing_skus:
+                missing_skus[sku] = item_name[:60]
 
         # Recipient name
         first_name = row.get('Shipping address first name', '').strip()
@@ -2540,6 +2820,10 @@ def mirakl_to_evri_rows(orders, marketplace):
         country_raw = row.get('Shipping address country', '').strip()
         phone = row.get('Shipping address phone', '').strip()
 
+        # Email — skip Mirakl proxy addresses
+        email_raw = row.get('Shipping address email', '').strip()
+        email = '' if '@notification.mirakl.net' in email_raw else email_raw
+
         # Normalise country code to ISO2
         country = 'GB'
         if country_raw.upper() in ('GBR', 'UK', 'GB'):
@@ -2547,14 +2831,14 @@ def mirakl_to_evri_rows(orders, marketplace):
         elif country_raw:
             country = country_raw[:2].upper()
 
-        # Property = company + street1 if company present, else street1
-        if company:
-            prop = company + ', ' + street1
-        else:
-            prop = street1
-        street = street2
+        # Split street1 into Property (house name/number) and Street
+        prop, street = split_address(street1, street2)
 
-        # Check Zone B / out-of-area
+        # Prepend company to Property if present
+        if company:
+            prop = company + ', ' + prop if prop else company
+
+        # Flag Zone B / out-of-area (included in CSV — Evri Direct handles them)
         flagged, reason = is_out_of_area(postcode)
         if flagged:
             zone_b_orders.append({
@@ -2564,17 +2848,17 @@ def mirakl_to_evri_rows(orders, marketplace):
                 'reason': reason
             })
             stats['zone_b'] += 1
-            continue  # Skip out-of-area orders
+            # NOT skipped — Evri Direct supports Zone B postcodes
 
         # Build Evri row — one row per unit of quantity
         for _ in range(quantity):
             evri_row = {
                 'Item Name': item_name[:80] if item_name else f'Order {order_num}',
                 'Value': value,
-                'Weight': weight_kg,
-                'Length': '',
-                'Width': '',
-                'Height': '',
+                'Weight': weight_kg if weight_kg else '',
+                'Length': length_cm if length_cm else '',
+                'Width': width_cm if width_cm else '',
+                'Height': height_cm if height_cm else '',
                 'Name': name,
                 'Property': prop,
                 'Street': street,
@@ -2586,13 +2870,13 @@ def mirakl_to_evri_rows(orders, marketplace):
                 'Reference': order_num,
                 'SKU': sku,
                 'Quantity': 1,
-                'Email': ''
+                'Email': email
             }
             evri_rows.append(evri_row)
 
         stats['converted'] += quantity
 
-    return evri_rows, zone_b_orders, stats
+    return evri_rows, zone_b_orders, missing_skus, stats
 
 
 @app.route('/convert-mirakl', methods=['POST'])
@@ -2604,7 +2888,9 @@ def convert_mirakl():
 
     all_evri_rows = []
     all_zone_b = []
-    all_stats = {'total': 0, 'converted': 0, 'zone_b': 0, 'files': 0, 'marketplaces': set()}
+    seen_orders = set()  # Track order numbers to detect duplicates across files
+    all_stats = {'total': 0, 'converted': 0, 'zone_b': 0, 'files': 0,
+                 'marketplaces': set(), 'duplicates': 0}
 
     for f in uploaded:
         if not f.filename.lower().endswith('.csv'):
@@ -2615,7 +2901,21 @@ def convert_mirakl():
         except Exception as e:
             return jsonify({'error': f'Error parsing {f.filename}: {str(e)}'}), 400
 
-        evri_rows, zone_b, stats = mirakl_to_evri_rows(orders, marketplace)
+        # De-duplicate: remove orders already seen in previous files
+        unique_orders = []
+        file_dups = 0
+        for order in orders:
+            order_key = order.get('Order number', '').strip()
+            if order_key and order_key in seen_orders:
+                file_dups += 1
+                continue
+            if order_key:
+                seen_orders.add(order_key)
+            unique_orders.append(order)
+
+        all_stats['duplicates'] += file_dups
+
+        evri_rows, zone_b, missing, stats = mirakl_to_evri_rows(unique_orders, marketplace)
         all_evri_rows.extend(evri_rows)
         all_zone_b.extend(zone_b)
         all_stats['total'] += stats['total']
@@ -2623,6 +2923,9 @@ def convert_mirakl():
         all_stats['zone_b'] += stats['zone_b']
         all_stats['files'] += 1
         all_stats['marketplaces'].add(marketplace)
+        all_stats.setdefault('missing_skus', {}).update(missing)
+        all_stats['dims_from_db'] = all_stats.get('dims_from_db', 0) + stats.get('dims_from_db', 0)
+        all_stats['dims_missing'] = all_stats.get('dims_missing', 0) + stats.get('dims_missing', 0)
 
     if not all_evri_rows:
         return jsonify({
@@ -2658,9 +2961,13 @@ def convert_mirakl():
             'converted_rows': all_stats['converted'],
             'zone_b': all_stats['zone_b'],
             'files_processed': all_stats['files'],
-            'marketplaces': list(all_stats['marketplaces'])
+            'marketplaces': list(all_stats['marketplaces']),
+            'dims_from_db': all_stats.get('dims_from_db', 0),
+            'dims_missing': all_stats.get('dims_missing', 0),
+            'duplicates': all_stats.get('duplicates', 0)
         },
-        'zone_b': all_zone_b
+        'zone_b': all_zone_b,
+        'missing_skus': all_stats.get('missing_skus', {})
     })
 
 
