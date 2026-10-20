@@ -1670,13 +1670,18 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
 def classify_order_id(order_id):
     """Classify a marketplace order ID by its format.
     Returns 'tesco', 'bnq', 'amazon', 'shopify', or 'unknown'.
+    Mirakl order IDs:
+      Tesco: 123-4567-89-A  (3-4 digit groups separated by dashes, ending in -Letter)
+      B&Q:   1234567890123-A or 1234567890123-A-1  (long number, dash, letter, optional line suffix)
     """
     if not order_id:
         return 'unknown'
     oid = re.sub(r'-R\d+$', '', order_id.strip())  # strip replacement suffix
-    if re.match(r'^\d{3,4}-\d{3,4}-\d{2,3}-[A-Z]$', oid):
+    # Strip Mirakl line-item suffix (e.g. -A-1 → -A)
+    oid_base = re.sub(r'(-[A-Z])-\d+$', r'\1', oid)
+    if re.match(r'^\d{3,4}-\d{3,4}-\d{2,3}-[A-Z]$', oid_base):
         return 'tesco'
-    if re.match(r'^\d{6,}-[A-Z]$', oid):
+    if re.match(r'^\d{6,}-[A-Z]$', oid_base):
         return 'bnq'
     if re.match(r'^\d{3}-\d{7}-\d{7}$', oid):
         return 'amazon'
@@ -2310,7 +2315,8 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
     update(96, 'Generating tracking uploads...')
     tracking_summary = {'tesco': 0, 'bnq': 0, 'skipped_dup': 0,
                         'skipped_unknown': 0, 'no_tracking': 0,
-                        'tesco_file': None, 'bnq_file': None}
+                        'tesco_file': None, 'bnq_file': None,
+                        'unknown_ids': []}
     tracking_files_info = []
 
     # Collect tracking data from all included entries (labels that went into the PDF)
@@ -2339,6 +2345,8 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
                 tracking_summary['skipped_dup'] += 1
             elif t['channel'] not in ('tesco', 'bnq'):
                 tracking_summary['skipped_unknown'] += 1
+                if len(tracking_summary['unknown_ids']) < 5:
+                    tracking_summary['unknown_ids'].append(t['order_id'])
             else:
                 new_tracking.append(t)
 
