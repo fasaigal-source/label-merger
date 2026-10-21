@@ -3951,6 +3951,535 @@ def admin_delete_alias():
     return jsonify({'ok': ok})
 
 
+# ── SHOPIFY → EVRI CONVERTER ─────────────────────────────────────────────────
+
+def parse_shopify_csv(file_data):
+    """Parse a Shopify orders export CSV and group rows by order.
+    Shopify puts one row per line-item, so a single order with 3 items has 3 rows.
+    Returns a list of order dicts, each with aggregated line items.
+    """
+    text = file_data.decode('utf-8-sig')
+    reader = csv.DictReader(io.StringIO(text))
+    orders = {}  # keyed by Name (order number)
+
+    for row in reader:
+        order_name = (row.get('Name') or '').strip()
+        if not order_name:
+            continue
+
+        # Skip cancelled orders
+        if row.get('Cancelled at', '').strip():
+            continue
+
+        # Skip already-fulfilled orders if user wants only unfulfilled
+        # (we include all non-cancelled for now — user can filter)
+
+        if order_name not in orders:
+            orders[order_name] = {
+                'name': order_name,
+                'email': (row.get('Email') or '').strip(),
+                'total': (row.get('Total') or '0').strip(),
+                'shipping_name': (row.get('Shipping Name') or '').strip(),
+                'shipping_address1': (row.get('Shipping Address1') or '').strip(),
+                'shipping_address2': (row.get('Shipping Address2') or '').strip(),
+                'shipping_company': (row.get('Shipping Company') or '').strip(),
+                'shipping_city': (row.get('Shipping City') or '').strip(),
+                'shipping_zip': (row.get('Shipping Zip') or '').strip(),
+                'shipping_province': (row.get('Shipping Province') or '').strip(),
+                'shipping_country': (row.get('Shipping Country') or row.get('Shipping Country Code') or '').strip(),
+                'shipping_phone': (row.get('Shipping Phone') or row.get('Phone') or '').strip(),
+                'fulfillment_status': (row.get('Fulfillment Status') or '').strip().lower(),
+                'financial_status': (row.get('Financial Status') or '').strip().lower(),
+                'line_items': []
+            }
+
+        # Add this line item
+        qty = 1
+        try:
+            qty = int(float(row.get('Lineitem quantity', '1').strip() or '1'))
+        except (ValueError, TypeError):
+            qty = 1
+
+        li = {
+            'name': (row.get('Lineitem name') or '').strip(),
+            'sku': (row.get('Lineitem sku') or '').strip(),
+            'price': (row.get('Lineitem price') or '0').strip(),
+            'quantity': qty,
+        }
+        orders[order_name]['line_items'].append(li)
+
+    return list(orders.values())
+
+
+def shopify_to_evri_rows(orders):
+    """Convert parsed Shopify orders to Evri CSV rows.
+    Returns (evri_rows, zone_b_orders, missing_skus, stats).
+    """
+    dims_map = get_sku_dimensions_map()
+
+    evri_rows = []
+    zone_b_orders = []
+    missing_skus = {}
+    stats = {'total': len(orders), 'converted': 0, 'zone_b': 0,
+             'unfulfilled': 0, 'fulfilled_skipped': 0,
+             'dims_from_db': 0, 'dims_missing': 0}
+
+    for order in orders:
+        order_name = order['name']
+
+        # Address fields
+        name = order['shipping_name']
+        if not name:
+            continue  # no shipping address — skip
+
+        company = order['shipping_company']
+        prop, street = split_address(order['shipping_address1'], order['shipping_address2'])
+        if company:
+            prop = company + ', ' + prop if prop else company
+
+        city = order['shipping_city']
+        county = order['shipping_province']
+        postcode = order['shipping_zip']
+        phone = order['shipping_phone']
+        email = order['email']
+
+        # Normalise country
+        country_raw = order['shipping_country'].upper()
+        country = 'GB'
+        if country_raw in ('GBR', 'UK', 'GB', 'UNITED KINGDOM', 'GREAT BRITAIN'):
+            country = 'GB'
+        elif country_raw:
+            country = country_raw[:2]
+
+        # Zone B check
+        flagged, reason = is_out_of_area(postcode)
+        if flagged:
+            zone_b_orders.append({
+                'order': order_name, 'name': name,
+                'postcode': postcode, 'reason': reason
+            })
+            stats['zone_b'] += 1
+
+        # Track fulfillment
+        if order['fulfillment_status'] == 'unfulfilled' or not order['fulfillment_status']:
+            stats['unfulfilled'] += 1
+
+        # Build one Evri row per line-item unit
+        for li in order['line_items']:
+            sku = li['sku']
+
+            # Weight & dims from DB
+            weight_kg = ''
+            length_cm = ''
+            width_cm = ''
+            height_cm = ''
+            if sku and sku in dims_map:
+                d = dims_map[sku]
+                weight_kg = d.get('weight', '')
+                length_cm = d.get('length', '')
+                width_cm = d.get('width', '')
+                height_cm = d.get('height', '')
+                stats['dims_from_db'] += 1
+            else:
+                stats['dims_missing'] += 1
+                if sku and sku not in missing_skus:
+                    missing_skus[sku] = (li['name'] or '')[:60]
+
+            for _ in range(li['quantity']):
+                evri_row = {
+                    'Item Name': (li['name'] or f'Order {order_name}')[:80],
+                    'Value': li['price'],
+                    'Weight': weight_kg,
+                    'Length': length_cm,
+                    'Width': width_cm,
+                    'Height': height_cm,
+                    'Name': name,
+                    'Property': prop,
+                    'Street': street,
+                    'Town': city,
+                    'County': county,
+                    'PostCode': postcode,
+                    'Country': country,
+                    'Telephone': phone,
+                    'Reference': order_name,
+                    'SKU': sku,
+                    'Quantity': 1,
+                    'Email': email,
+                }
+                evri_rows.append(evri_row)
+
+            stats['converted'] += li['quantity']
+
+    return evri_rows, zone_b_orders, missing_skus, stats
+
+
+@app.route('/csv-converter')
+def csv_converter_page():
+    return render_template('csv_converter.html')
+
+
+@app.route('/convert-shopify', methods=['POST'])
+def convert_shopify():
+    """Accept a Shopify orders export CSV and return an Evri bulk-upload CSV."""
+    uploaded = request.files.getlist('files') or request.files.getlist('file')
+    if not uploaded:
+        return jsonify({'error': 'No file uploaded'}), 400
+
+    filter_unfulfilled = request.form.get('filter_unfulfilled', 'true') == 'true'
+
+    all_evri_rows = []
+    all_zone_b = []
+    all_stats = {'total': 0, 'converted': 0, 'zone_b': 0, 'files': 0,
+                 'unfulfilled': 0, 'fulfilled_skipped': 0}
+
+    for f in uploaded:
+        if not f.filename.lower().endswith('.csv'):
+            continue
+        file_data = f.read()
+        try:
+            orders = parse_shopify_csv(file_data)
+        except Exception as e:
+            return jsonify({'error': f'Error parsing {f.filename}: {str(e)}'}), 400
+
+        # Optionally filter to only unfulfilled orders
+        if filter_unfulfilled:
+            original_count = len(orders)
+            orders = [o for o in orders if o['fulfillment_status'] in ('unfulfilled', 'pending', '')]
+            all_stats['fulfilled_skipped'] = all_stats.get('fulfilled_skipped', 0) + (original_count - len(orders))
+
+        evri_rows, zone_b, missing, stats = shopify_to_evri_rows(orders)
+        all_evri_rows.extend(evri_rows)
+        all_zone_b.extend(zone_b)
+        all_stats['total'] += stats['total']
+        all_stats['converted'] += stats['converted']
+        all_stats['zone_b'] += stats['zone_b']
+        all_stats['unfulfilled'] += stats.get('unfulfilled', 0)
+        all_stats['files'] += 1
+        all_stats.setdefault('missing_skus', {}).update(missing)
+        all_stats['dims_from_db'] = all_stats.get('dims_from_db', 0) + stats.get('dims_from_db', 0)
+        all_stats['dims_missing'] = all_stats.get('dims_missing', 0) + stats.get('dims_missing', 0)
+
+    if not all_evri_rows:
+        return jsonify({
+            'error': 'No orders to convert',
+            'zone_b': all_zone_b,
+            'stats': all_stats
+        }), 400
+
+    # Generate the Evri CSV
+    output = io.StringIO()
+    fieldnames = ['Item Name', 'Value', 'Weight', 'Length', 'Width', 'Height',
+                  'Name', 'Property', 'Street', 'Town', 'County', 'PostCode',
+                  'Country', 'Telephone', 'Reference', 'SKU', 'Quantity', 'Email']
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(all_evri_rows)
+    csv_bytes = output.getvalue().encode('utf-8')
+
+    job_id = str(uuid.uuid4())[:8]
+    with jobs_lock:
+        jobs[job_id] = {
+            'status': 'done',
+            'type': 'shopify_convert',
+            'csv_data': csv_bytes,
+            'filename': f'evri_shopify_{datetime.now().strftime("%Y%m%d_%H%M")}.csv'
+        }
+
+    return jsonify({
+        'job_id': job_id,
+        'stats': {
+            'total_orders': all_stats['total'],
+            'converted_rows': all_stats['converted'],
+            'zone_b': all_stats['zone_b'],
+            'files_processed': all_stats['files'],
+            'unfulfilled': all_stats.get('unfulfilled', 0),
+            'fulfilled_skipped': all_stats.get('fulfilled_skipped', 0),
+            'dims_from_db': all_stats.get('dims_from_db', 0),
+            'dims_missing': all_stats.get('dims_missing', 0),
+        },
+        'zone_b': all_zone_b,
+        'missing_skus': all_stats.get('missing_skus', {})
+    })
+
+
+@app.route('/download-shopify-csv/<job_id>')
+def download_shopify_csv(job_id):
+    """Serve the generated Shopify→Evri CSV."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job or job.get('type') != 'shopify_convert':
+        return 'Not found', 404
+    return send_file(
+        io.BytesIO(job['csv_data']),
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=job.get('filename', 'evri_shopify.csv')
+    )
+
+
+# ── AMAZON (LINNWORKS) → EVRI CONVERTER ──────────────────────────────────────
+
+def parse_amazon_csv(file_data):
+    """Parse a Linnworks / channel-manager Amazon orders export CSV.
+    Groups rows by order number (multiple line items per order).
+    Returns a list of order dicts with aggregated line items.
+    """
+    text = file_data.decode('utf-8-sig')
+    reader = csv.DictReader(io.StringIO(text))
+    orders = {}
+
+    for row in reader:
+        order_num = (row.get('number') or '').strip()
+        if not order_num:
+            continue
+
+        # Skip cancelled
+        if row.get('cancelled_at', '').strip():
+            continue
+
+        status = (row.get('status') or '').strip().lower()
+
+        if order_num not in orders:
+            # Name
+            first = (row.get('shipping_address_first_name') or '').strip()
+            last = (row.get('shipping_address_last_name') or '').strip()
+
+            # Phone — try shipping first, then billing, then customer
+            phone = (row.get('shipping_address_phone') or
+                     row.get('billing_address_phone') or
+                     row.get('customer_phone') or
+                     row.get('customer_mobile') or '').strip()
+
+            orders[order_num] = {
+                'number': order_num,
+                'name': f"{first} {last}".strip(),
+                'email': (row.get('customer_email') or '').strip(),
+                'company': (row.get('shipping_address_company') or '').strip(),
+                'address1': (row.get('shipping_address_address1') or '').strip(),
+                'address2': (row.get('shipping_address_address2') or '').strip(),
+                'city': (row.get('shipping_address_city') or '').strip(),
+                'state': (row.get('shipping_address_state') or '').strip(),
+                'postcode': (row.get('shipping_address_zip') or '').strip(),
+                'country': (row.get('shipping_address_country') or '').strip(),
+                'phone': phone,
+                'status': status,
+                'total': (row.get('total_price') or '0').strip(),
+                'line_items': []
+            }
+
+        qty = 1
+        try:
+            qty = int(float(row.get('quantity', '1').strip() or '1'))
+        except (ValueError, TypeError):
+            qty = 1
+
+        orders[order_num]['line_items'].append({
+            'name': (row.get('product_title') or '').strip(),
+            'sku': (row.get('sku') or '').strip(),
+            'price': (row.get('price_per_unit') or '0').strip(),
+            'quantity': qty,
+            'variant': (row.get('variant_title') or '').strip(),
+        })
+
+    return list(orders.values())
+
+
+def amazon_to_evri_rows(orders):
+    """Convert parsed Amazon/Linnworks orders to Evri CSV rows."""
+    dims_map = get_sku_dimensions_map()
+
+    evri_rows = []
+    zone_b_orders = []
+    missing_skus = {}
+    stats = {'total': len(orders), 'converted': 0, 'zone_b': 0,
+             'awaiting': 0, 'dims_from_db': 0, 'dims_missing': 0}
+
+    for order in orders:
+        order_num = order['number']
+        name = order['name']
+        if not name:
+            continue
+
+        company = order['company']
+        prop, street = split_address(order['address1'], order['address2'])
+        if company:
+            prop = company + ', ' + prop if prop else company
+
+        city = order['city']
+        county = order['state']
+        postcode = order['postcode']
+        phone = order['phone']
+
+        # Skip marketplace proxy emails
+        email_raw = order['email']
+        email = '' if '@marketplace.amazon' in email_raw else email_raw
+
+        # Country
+        country_raw = order['country'].upper()
+        country = 'GB'
+        if country_raw in ('GBR', 'UK', 'GB', 'UNITED KINGDOM', 'GREAT BRITAIN'):
+            country = 'GB'
+        elif country_raw:
+            country = country_raw[:2]
+
+        # Zone B
+        flagged, reason = is_out_of_area(postcode)
+        if flagged:
+            zone_b_orders.append({
+                'order': order_num, 'name': name,
+                'postcode': postcode, 'reason': reason
+            })
+            stats['zone_b'] += 1
+
+        if order['status'] == 'awaiting_fulfillment':
+            stats['awaiting'] += 1
+
+        for li in order['line_items']:
+            sku = li['sku']
+            weight_kg = ''
+            length_cm = ''
+            width_cm = ''
+            height_cm = ''
+            if sku and sku in dims_map:
+                d = dims_map[sku]
+                weight_kg = d.get('weight', '')
+                length_cm = d.get('length', '')
+                width_cm = d.get('width', '')
+                height_cm = d.get('height', '')
+                stats['dims_from_db'] += 1
+            else:
+                stats['dims_missing'] += 1
+                if sku and sku not in missing_skus:
+                    missing_skus[sku] = (li['name'] or '')[:60]
+
+            item_name = li['name']
+            if li['variant']:
+                item_name = f"{item_name} - {li['variant']}"
+
+            for _ in range(li['quantity']):
+                evri_rows.append({
+                    'Item Name': (item_name or f'Order {order_num}')[:80],
+                    'Value': li['price'],
+                    'Weight': weight_kg,
+                    'Length': length_cm,
+                    'Width': width_cm,
+                    'Height': height_cm,
+                    'Name': name,
+                    'Property': prop,
+                    'Street': street,
+                    'Town': city,
+                    'County': county,
+                    'PostCode': postcode,
+                    'Country': country,
+                    'Telephone': phone,
+                    'Reference': order_num,
+                    'SKU': sku,
+                    'Quantity': 1,
+                    'Email': email,
+                })
+
+            stats['converted'] += li['quantity']
+
+    return evri_rows, zone_b_orders, missing_skus, stats
+
+
+@app.route('/convert-amazon', methods=['POST'])
+def convert_amazon():
+    """Accept a Linnworks/channel-manager Amazon orders CSV and return Evri CSV."""
+    uploaded = request.files.getlist('files') or request.files.getlist('file')
+    if not uploaded:
+        return jsonify({'error': 'No file uploaded'}), 400
+
+    filter_awaiting = request.form.get('filter_unfulfilled', 'true') == 'true'
+
+    all_evri_rows = []
+    all_zone_b = []
+    all_stats = {'total': 0, 'converted': 0, 'zone_b': 0, 'files': 0,
+                 'awaiting': 0, 'fulfilled_skipped': 0}
+
+    for f in uploaded:
+        if not f.filename.lower().endswith('.csv'):
+            continue
+        file_data = f.read()
+        try:
+            orders = parse_amazon_csv(file_data)
+        except Exception as e:
+            return jsonify({'error': f'Error parsing {f.filename}: {str(e)}'}), 400
+
+        if filter_awaiting:
+            original_count = len(orders)
+            orders = [o for o in orders if o['status'] in ('awaiting_fulfillment', 'awaiting_shipment')]
+            all_stats['fulfilled_skipped'] = all_stats.get('fulfilled_skipped', 0) + (original_count - len(orders))
+
+        evri_rows, zone_b, missing, stats = amazon_to_evri_rows(orders)
+        all_evri_rows.extend(evri_rows)
+        all_zone_b.extend(zone_b)
+        all_stats['total'] += stats['total']
+        all_stats['converted'] += stats['converted']
+        all_stats['zone_b'] += stats['zone_b']
+        all_stats['awaiting'] += stats.get('awaiting', 0)
+        all_stats['files'] += 1
+        all_stats.setdefault('missing_skus', {}).update(missing)
+        all_stats['dims_from_db'] = all_stats.get('dims_from_db', 0) + stats.get('dims_from_db', 0)
+        all_stats['dims_missing'] = all_stats.get('dims_missing', 0) + stats.get('dims_missing', 0)
+
+    if not all_evri_rows:
+        return jsonify({
+            'error': 'No orders to convert',
+            'zone_b': all_zone_b,
+            'stats': all_stats
+        }), 400
+
+    output = io.StringIO()
+    fieldnames = ['Item Name', 'Value', 'Weight', 'Length', 'Width', 'Height',
+                  'Name', 'Property', 'Street', 'Town', 'County', 'PostCode',
+                  'Country', 'Telephone', 'Reference', 'SKU', 'Quantity', 'Email']
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(all_evri_rows)
+    csv_bytes = output.getvalue().encode('utf-8')
+
+    job_id = str(uuid.uuid4())[:8]
+    with jobs_lock:
+        jobs[job_id] = {
+            'status': 'done',
+            'type': 'amazon_convert',
+            'csv_data': csv_bytes,
+            'filename': f'evri_amazon_{datetime.now().strftime("%Y%m%d_%H%M")}.csv'
+        }
+
+    return jsonify({
+        'job_id': job_id,
+        'stats': {
+            'total_orders': all_stats['total'],
+            'converted_rows': all_stats['converted'],
+            'zone_b': all_stats['zone_b'],
+            'files_processed': all_stats['files'],
+            'awaiting': all_stats.get('awaiting', 0),
+            'fulfilled_skipped': all_stats.get('fulfilled_skipped', 0),
+            'dims_from_db': all_stats.get('dims_from_db', 0),
+            'dims_missing': all_stats.get('dims_missing', 0),
+        },
+        'zone_b': all_zone_b,
+        'missing_skus': all_stats.get('missing_skus', {})
+    })
+
+
+@app.route('/download-amazon-csv/<job_id>')
+def download_amazon_csv(job_id):
+    """Serve the generated Amazon→Evri CSV."""
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job or job.get('type') != 'amazon_convert':
+        return 'Not found', 404
+    return send_file(
+        io.BytesIO(job['csv_data']),
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=job.get('filename', 'evri_amazon.csv')
+    )
+
+
 if __name__ == '__main__':
     init_db()
     port = int(os.environ.get('PORT', 5000))
