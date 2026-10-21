@@ -79,6 +79,24 @@
   #results-section { display: none; }
   #reset-btn { width: 100%; padding: 10px; background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: var(--radius); font-size: 13px; cursor: pointer; margin-top: 8px; transition: background 0.1s; }
   #reset-btn:hover { background: var(--bg); color: var(--text); }
+  /* SKU Dimensions table */
+  .sku-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 0.5rem; }
+  .sku-table th { text-align: left; padding: 6px 8px; border-bottom: 2px solid var(--border); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+  .sku-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); }
+  .sku-table tr:hover td { background: var(--bg); }
+  .sku-table input[type="text"], .sku-table input[type="number"] { width: 100%; padding: 4px 6px; border: 1px solid var(--border); border-radius: 5px; font-size: 12px; background: var(--card); }
+  .sku-table input[type="number"] { width: 70px; }
+  .sku-btn { padding: 3px 10px; border: none; border-radius: 5px; font-size: 11px; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+  .sku-btn:hover { opacity: 0.8; }
+  .sku-btn.save { background: var(--green); color: white; }
+  .sku-btn.del { background: var(--red-bg); color: var(--red); }
+  .sku-btn.add { background: var(--accent); color: white; }
+  .sku-empty { font-size: 13px; color: var(--muted); padding: 1rem 0; text-align: center; }
+  .missing-sku-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: var(--amber-bg); border-radius: 7px; font-size: 12px; color: var(--amber); margin-bottom: 5px; flex-wrap: wrap; }
+  .missing-sku-row .sku-code { font-weight: 700; min-width: 100px; }
+  .missing-sku-row input { padding: 3px 6px; border: 1px solid #f59e0b; border-radius: 4px; font-size: 12px; width: 65px; background: white; }
+  .missing-sku-row .sku-btn { margin-left: auto; }
+  @media (max-width: 500px) { .sku-table input[type="number"] { width: 55px; } }
 </style>
 </head>
 <body>
@@ -129,6 +147,26 @@
   </div>
 
   <button id="reset-btn" onclick="resetAll()" style="display:none;">Start over</button>
+
+  <div class="card" id="sku-section">
+    <div class="card-title">SKU Weight & Dimensions</div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:0.75rem;">Manage default weight and dimensions for each SKU. These are used by all converters when the source CSV doesn't include them.</div>
+    <div id="sku-table-wrap"></div>
+  </div>
+
+  <div class="card" id="template-section">
+    <div class="card-title">Tracking Templates (Mirakl)</div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:0.75rem;">Status of tracking CSV templates for Tesco and B&Q bulk uploads.</div>
+    <div id="template-status">Loading…</div>
+    <div style="margin-top:0.75rem;display:flex;gap:10px;flex-wrap:wrap;">
+      <label style="font-size:12px;cursor:pointer;padding:5px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);">
+        Upload Tesco template <input type="file" accept=".csv" hidden onchange="uploadTemplate('tesco',this)">
+      </label>
+      <label style="font-size:12px;cursor:pointer;padding:5px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);">
+        Upload B&Q template <input type="file" accept=".csv" hidden onchange="uploadTemplate('bnq',this)">
+      </label>
+    </div>
+  </div>
 </main>
 
 <script>
@@ -269,7 +307,7 @@ function showResults(data, downloadBase) {
     html += `<div class="info-box blue">Removed ${s.duplicates} duplicate order${s.duplicates !== 1 ? 's' : ''} across files</div>`;
   }
   if (s.dims_missing) {
-    html += `<div class="info-box amber">⚠ ${s.dims_missing} row${s.dims_missing !== 1 ? 's' : ''} missing weight/dimensions — add SKUs in <a href="/" style="color:inherit;text-decoration:underline;">Label Merger</a></div>`;
+    html += `<div class="info-box amber">⚠ ${s.dims_missing} row${s.dims_missing !== 1 ? 's' : ''} missing weight/dimensions — <a href="#sku-section" style="color:inherit;text-decoration:underline;">add SKU dimensions below</a></div>`;
   }
 
   // Zone B list
@@ -281,11 +319,20 @@ function showResults(data, downloadBase) {
     html += `</div>`;
   }
 
-  // Missing SKUs
+  // Missing SKUs — inline quick-add
   if (data.missing_skus && Object.keys(data.missing_skus).length) {
-    html += `<div class="missing-sku-list"><strong style="font-size:12px;">SKUs missing dimensions:</strong>`;
+    html += `<div style="margin-top:0.75rem;"><strong style="font-size:12px;color:var(--amber);">SKUs missing dimensions — add inline:</strong>`;
     for (const [sku, name] of Object.entries(data.missing_skus)) {
-      html += `<div class="missing-sku-item"><span>${sku}</span><span style="opacity:0.7;">${name}</span></div>`;
+      const id = sku.replace(/[^a-zA-Z0-9]/g, '_');
+      html += `<div class="missing-sku-row" id="missing-${id}">
+        <span class="sku-code">${sku}</span>
+        <span style="flex:1;font-size:11px;">${name}</span>
+        <input type="number" id="mw-${id}" placeholder="kg" step="0.1" min="0" title="Weight (kg)">
+        <input type="number" id="ml-${id}" placeholder="L cm" step="1" min="0" title="Length (cm)">
+        <input type="number" id="mwd-${id}" placeholder="W cm" step="1" min="0" title="Width (cm)">
+        <input type="number" id="mh-${id}" placeholder="H cm" step="1" min="0" title="Height (cm)">
+        <button class="sku-btn save" onclick="quickAddSku('${sku}','${id}','${name.replace(/'/g,"\\'")}')">Save</button>
+      </div>`;
     }
     html += `</div>`;
   }
@@ -309,6 +356,133 @@ function resetAll() {
   document.getElementById('results-section').style.display = 'none';
   document.getElementById('reset-btn').style.display = 'none';
 }
+
+// ── SKU Dimensions Management ──
+async function loadSkuTable() {
+  const wrap = document.getElementById('sku-table-wrap');
+  if (!wrap) return;
+  try {
+    const res = await fetch('/sku-dimensions');
+    const skus = await res.json();
+    if (!skus.length) {
+      wrap.innerHTML = `<div class="sku-empty">No SKU dimensions saved yet. Add your first SKU below, or convert a CSV to see which SKUs are missing.</div>
+        <div style="margin-top:0.5rem;">${skuAddRowHtml()}</div>`;
+      return;
+    }
+    let html = '<table class="sku-table"><thead><tr><th>SKU</th><th>Item Name</th><th>Weight (kg)</th><th>L (cm)</th><th>W (cm)</th><th>H (cm)</th><th></th></tr></thead><tbody>';
+    skus.forEach(s => {
+      html += `<tr>
+        <td style="font-weight:600;">${s.sku}</td>
+        <td>${s.item_name || ''}</td>
+        <td>${s.weight_kg}</td>
+        <td>${s.length_cm}</td>
+        <td>${s.width_cm}</td>
+        <td>${s.height_cm}</td>
+        <td><button class="sku-btn del" onclick="deleteSku('${s.sku}')">Delete</button></td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+    html += `<div style="margin-top:0.75rem;">${skuAddRowHtml()}</div>`;
+    wrap.innerHTML = html;
+  } catch(e) {
+    wrap.innerHTML = '<div class="sku-empty">Could not load SKU dimensions.</div>';
+  }
+}
+
+function skuAddRowHtml() {
+  return `<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+    <input type="text" id="new-sku" placeholder="SKU code" style="width:120px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
+    <input type="text" id="new-sku-name" placeholder="Item name" style="flex:1;min-width:100px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
+    <input type="number" id="new-sku-w" placeholder="kg" step="0.1" min="0" style="width:65px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
+    <input type="number" id="new-sku-l" placeholder="L cm" step="1" min="0" style="width:65px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
+    <input type="number" id="new-sku-wd" placeholder="W cm" step="1" min="0" style="width:65px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
+    <input type="number" id="new-sku-h" placeholder="H cm" step="1" min="0" style="width:65px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
+    <button class="sku-btn add" onclick="addSku()">+ Add</button>
+  </div>`;
+}
+
+async function addSku() {
+  const sku = document.getElementById('new-sku').value.trim();
+  if (!sku) { alert('Enter a SKU code'); return; }
+  const body = {
+    sku, item_name: document.getElementById('new-sku-name').value.trim(),
+    weight_kg: parseFloat(document.getElementById('new-sku-w').value) || 0,
+    length_cm: parseFloat(document.getElementById('new-sku-l').value) || 0,
+    width_cm: parseFloat(document.getElementById('new-sku-wd').value) || 0,
+    height_cm: parseFloat(document.getElementById('new-sku-h').value) || 0
+  };
+  try {
+    const res = await fetch('/sku-dimensions', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    loadSkuTable();
+  } catch(e) { alert('Failed to save: ' + e.message); }
+}
+
+async function deleteSku(sku) {
+  if (!confirm('Delete dimensions for ' + sku + '?')) return;
+  try {
+    await fetch('/sku-dimensions/' + encodeURIComponent(sku), { method:'DELETE' });
+    loadSkuTable();
+  } catch(e) { alert('Failed to delete: ' + e.message); }
+}
+
+async function quickAddSku(sku, id, itemName) {
+  const body = {
+    sku, item_name: itemName,
+    weight_kg: parseFloat(document.getElementById('mw-' + id).value) || 0,
+    length_cm: parseFloat(document.getElementById('ml-' + id).value) || 0,
+    width_cm: parseFloat(document.getElementById('mwd-' + id).value) || 0,
+    height_cm: parseFloat(document.getElementById('mh-' + id).value) || 0
+  };
+  if (!body.weight_kg) { alert('Please enter at least the weight'); return; }
+  try {
+    const res = await fetch('/sku-dimensions', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    const row = document.getElementById('missing-' + id);
+    if (row) { row.style.background = 'var(--green-bg)'; row.innerHTML = `<span class="sku-code">${sku}</span><span style="flex:1;color:var(--green);font-weight:600;">Saved</span>`; }
+    loadSkuTable();
+  } catch(e) { alert('Failed to save: ' + e.message); }
+}
+
+// ── Tracking Template Management ──
+async function loadTemplateStatus() {
+  const el = document.getElementById('template-status');
+  if (!el) return;
+  try {
+    const res = await fetch('/tracking-templates');
+    const templates = await res.json();
+    let badges = '<span style="display:inline-block;background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px;">Tesco — built-in</span>';
+    badges += '<span style="display:inline-block;background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px;">B&Q — built-in</span>';
+    if (templates.length) {
+      badges = templates.map(t => {
+        const date = new Date(t.uploaded_at).toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'});
+        return `<span style="display:inline-block;background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px;">${t.marketplace==='bnq'?'B&Q':'Tesco'} — custom ${date}</span>`;
+      }).join('');
+    }
+    el.innerHTML = badges;
+  } catch(e) { el.textContent = 'Templates: built-in'; }
+}
+
+async function uploadTemplate(marketplace, input) {
+  const file = input.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append('marketplace', marketplace);
+  form.append('file', file);
+  try {
+    const res = await fetch('/tracking-template', { method:'POST', body: form });
+    const data = await res.json();
+    if (data.error) { alert(data.error); return; }
+    input.value = '';
+    loadTemplateStatus();
+  } catch(e) { alert('Upload failed: ' + e.message); }
+}
+
+// Load on page ready
+loadSkuTable();
+loadTemplateStatus();
 </script>
 </body>
 </html>

@@ -107,26 +107,7 @@
   .tracking-row a { font-size: 12px; font-weight: 600; color: var(--blue); text-decoration: none; white-space: nowrap; }
   .tracking-row a:hover { text-decoration: underline; }
   .tracking-dup { font-size: 12px; color: var(--muted); margin-top: 4px; }
-  /* SKU Dimensions table */
-  #sku-section { display: none; }
-  .sku-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 0.5rem; }
-  .sku-table th { text-align: left; padding: 6px 8px; border-bottom: 2px solid var(--border); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
-  .sku-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); }
-  .sku-table tr:hover td { background: var(--bg); }
-  .sku-table input[type="text"], .sku-table input[type="number"] { width: 100%; padding: 4px 6px; border: 1px solid var(--border); border-radius: 5px; font-size: 12px; background: var(--card); }
-  .sku-table input[type="number"] { width: 70px; }
-  .sku-add-row td { background: var(--bg); }
-  .sku-btn { padding: 3px 10px; border: none; border-radius: 5px; font-size: 11px; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
-  .sku-btn:hover { opacity: 0.8; }
-  .sku-btn.save { background: var(--green); color: white; }
-  .sku-btn.del { background: var(--red-bg); color: var(--red); }
-  .sku-btn.add { background: var(--accent); color: white; }
-  .sku-empty { font-size: 13px; color: var(--muted); padding: 1rem 0; text-align: center; }
-  .missing-sku-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: var(--amber-bg); border-radius: 7px; font-size: 12px; color: var(--amber); margin-bottom: 5px; flex-wrap: wrap; }
-  .missing-sku-row .sku-code { font-weight: 700; min-width: 100px; }
-  .missing-sku-row input { padding: 3px 6px; border: 1px solid #f59e0b; border-radius: 4px; font-size: 12px; width: 65px; background: white; }
-  .missing-sku-row .sku-btn { margin-left: auto; }
-  @media (max-width: 500px) { .steps { grid-template-columns: 1fr; } h1 { font-size: 22px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } .sku-table input[type="number"] { width: 55px; } }
+  @media (max-width: 500px) { .steps { grid-template-columns: 1fr; } h1 { font-size: 22px; } .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 </style>
 </head>
 <body>
@@ -149,7 +130,6 @@
     <button type="button" class="modebtn" id="mode-thirdparty" onclick="setMode('thirdparty')">3rd-Party Labels</button>
     <button type="button" class="modebtn" id="mode-easyship" onclick="setMode('easyship')">Easy Ship</button>
     <button type="button" class="modebtn" id="mode-evri_direct" onclick="setMode('evri_direct')">Evri Direct</button>
-    <button type="button" class="modebtn" id="mode-mirakl" onclick="setMode('mirakl')">Mirakl → Evri</button>
   </div>
 
   <div class="card">
@@ -207,31 +187,6 @@
     <button id="reset-btn" onclick="resetApp()">Start again</button>
   </div>
 
-  <div class="card" id="mirakl-results" style="display:none;"></div>
-
-  <div class="card" id="sku-section">
-    <div class="card-title">SKU Weight & Dimensions <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);">— used for Evri CSV</span></div>
-    <div id="sku-table-wrap"></div>
-  </div>
-
-  <div class="card" id="template-section" style="display:none;">
-    <div class="card-title">Mirakl Tracking Templates <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);">— for shipment confirmation uploads</span></div>
-    <div id="template-status" style="font-size:12px;color:var(--muted);margin-bottom:0.75rem;">Loading...</div>
-    <div id="template-override" style="display:none;">
-      <div style="font-size:11px;color:var(--muted);margin-bottom:6px;">Override built-in templates (only needed if Mirakl changes their format):</div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <div style="flex:1;min-width:200px;">
-          <div style="font-size:12px;font-weight:600;margin-bottom:4px;">Tesco Template (.xlsx)</div>
-          <input type="file" id="tpl-tesco" accept=".xlsx" style="font-size:12px;" onchange="uploadTemplate('tesco', this)">
-        </div>
-        <div style="flex:1;min-width:200px;">
-          <div style="font-size:12px;font-weight:600;margin-bottom:4px;">B&Q Template (.xlsx)</div>
-          <input type="file" id="tpl-bnq" accept=".xlsx" style="font-size:12px;" onchange="uploadTemplate('bnq', this)">
-        </div>
-      </div>
-    </div>
-  </div>
-
   <div class="card">
     <div class="card-title">How it works</div>
     <div class="steps">
@@ -251,8 +206,7 @@ const MODE_DESC = {
   amazon: 'Amazon order PDFs (label + packing slip). SKU & quantity are OCR-read from each slip and stamped onto the Evri label. One PDF out — print and go.',
   thirdparty: '3rd-party labels that already have SKU & quantity printed on them. Each 4×8 label is resized to 4×6 and its SKU/qty is moved up into the empty space inside the label.',
   easyship: 'Amazon Easy Ship labels (full-page Evri). SKU & quantity are already on the label but tiny — this reads that line and stamps a big, clear version in the blank margin.',
-  evri_direct: 'Evri Direct business account labels. Packing slips are stripped, SKU is read and stamped onto the label, postcodes checked for Highland/out-of-area, sorted by SKU with pick list.',
-  mirakl: 'Convert Mirakl order export CSVs (Tesco or B&Q) into Evri bulk-upload CSV format. Auto-detects marketplace. Manage SKU weight & dimensions below.'
+  evri_direct: 'Evri Direct business account labels. Packing slips are stripped, SKU is read and stamped onto the label, postcodes checked for Highland/out-of-area, sorted by SKU with pick list.'
 };
 
 function setMode(m) {
@@ -261,28 +215,7 @@ function setMode(m) {
   document.getElementById('mode-thirdparty').classList.toggle('active', m === 'thirdparty');
   document.getElementById('mode-easyship').classList.toggle('active', m === 'easyship');
   document.getElementById('mode-evri_direct').classList.toggle('active', m === 'evri_direct');
-  document.getElementById('mode-mirakl').classList.toggle('active', m === 'mirakl');
   document.getElementById('mode-desc').textContent = MODE_DESC[m];
-
-  // Switch file input accept and labels for Mirakl CSV mode
-  const fileInput = document.getElementById('file-input');
-  const dropSub = document.querySelector('.drop-sub');
-  const dropHint = document.querySelector('.drop-hint');
-  const miraklResults = document.getElementById('mirakl-results');
-  if (m === 'mirakl') {
-    fileInput.accept = '.csv';
-    dropSub.innerHTML = 'Mirakl order export <strong>CSV</strong> files (Tesco or B&Q)';
-    dropHint.textContent = 'Upload one or more CSV files — marketplace is auto-detected';
-  } else {
-    fileInput.accept = '.zip,.pdf';
-    dropSub.innerHTML = 'ZIP file <strong>or</strong> multiple PDFs — all accepted';
-    dropHint.textContent = 'Hold Ctrl to select multiple PDFs at once';
-  }
-  if (miraklResults) miraklResults.style.display = 'none';
-  // Show/hide SKU dimensions and template sections
-  document.getElementById('sku-section').style.display = m === 'mirakl' ? 'block' : 'none';
-  document.getElementById('template-section').style.display = m === 'mirakl' ? 'block' : 'none';
-  if (m === 'mirakl') { loadSkuTable(); loadTemplateStatus(); }
   // Reset file list when switching modes
   selectedFiles = [];
   renderFileList();
@@ -299,9 +232,7 @@ function drop(e) {
 function filesSelected(fileList) {
   for (let f of fileList) {
     const lname = f.name.toLowerCase();
-    const allowed = uploadMode === 'mirakl'
-      ? lname.endsWith('.csv')
-      : (lname.endsWith('.pdf') || lname.endsWith('.zip'));
+    const allowed = lname.endsWith('.pdf') || lname.endsWith('.zip');
     if (allowed && !selectedFiles.find(x => x.name === f.name)) {
       selectedFiles.push(f);
     }
@@ -330,11 +261,6 @@ function renderFileList() {
 async function startProcessing() {
   if (!selectedFiles.length) return;
 
-  // Mirakl converter mode — separate flow
-  if (uploadMode === 'mirakl') {
-    return startMiraklConvert();
-  }
-
   const btn = document.getElementById('process-btn');
   btn.disabled = true;
   btn.textContent = '⏳ Uploading file(s)...';
@@ -358,221 +284,6 @@ async function startProcessing() {
     btn.disabled = false;
     btn.textContent = '▶ Click to start processing';
   }
-}
-
-async function startMiraklConvert() {
-  const btn = document.getElementById('process-btn');
-  btn.disabled = true;
-  btn.textContent = '⏳ Converting...';
-  document.getElementById('progress-section').style.display = 'none';
-  document.getElementById('results-section').style.display = 'none';
-
-  const form = new FormData();
-  for (let f of selectedFiles) form.append('files', f);
-
-  try {
-    const res = await fetch('/convert-mirakl', { method: 'POST', body: form });
-    const data = await res.json();
-    if (data.error && !data.stats) {
-      alert(data.error);
-      btn.disabled = false;
-      btn.textContent = '▶ Click to start processing';
-      return;
-    }
-    showMiraklResults(data);
-  } catch(e) {
-    alert('Conversion failed: ' + e.message);
-    btn.disabled = false;
-    btn.textContent = '▶ Click to start processing';
-  }
-}
-
-function showMiraklResults(data) {
-  const section = document.getElementById('mirakl-results');
-  const stats = data.stats || {};
-  const zoneB = data.zone_b || [];
-  const missingSkus = data.missing_skus || {};
-  const missingCount = Object.keys(missingSkus).length;
-  const marketplaces = (stats.marketplaces || []).map(m => m === 'tesco' ? 'Tesco' : 'B&Q').join(' + ');
-
-  let html = '<div class="stats-grid">';
-  html += `<div class="stat"><div class="stat-num">${stats.total_orders || 0}</div><div class="stat-lbl">Orders</div></div>`;
-  html += `<div class="stat ok"><div class="stat-num">${stats.converted_rows || 0}</div><div class="stat-lbl">Evri Rows</div></div>`;
-  if (stats.dims_from_db > 0) {
-    html += `<div class="stat" style="background:var(--green-bg);"><div class="stat-num" style="color:var(--green);">${stats.dims_from_db}</div><div class="stat-lbl">DB Dims</div></div>`;
-  }
-  if (missingCount > 0) {
-    html += `<div class="stat warn"><div class="stat-num">${missingCount}</div><div class="stat-lbl">Missing SKUs</div></div>`;
-  }
-  if (stats.duplicates > 0) {
-    html += `<div class="stat"><div class="stat-num" style="color:var(--muted);">${stats.duplicates}</div><div class="stat-lbl">Duplicates</div></div>`;
-  }
-  html += '</div>';
-
-  html += `<div style="margin:1rem 0 0.5rem;font-size:13px;color:var(--muted);">${stats.files_processed} file${stats.files_processed !== 1 ? 's' : ''} processed · ${marketplaces}</div>`;
-
-  if (data.job_id && stats.converted_rows > 0) {
-    html += `<a class="dl-btn" href="/download-evri-csv/${data.job_id}" style="display:inline-flex;margin-top:0.75rem;">⬇ Download Evri CSV (${stats.converted_rows} row${stats.converted_rows !== 1 ? 's' : ''})</a>`;
-  }
-
-  // Missing SKUs — let user add dimensions inline
-  if (missingCount > 0) {
-    html += '<div style="margin-top:1rem;"><div class="card-title" style="color:var(--amber);">⚠ SKUs missing weight & dimensions</div>';
-    html += '<div style="font-size:12px;color:var(--muted);margin-bottom:8px;">These rows have no weight/size in the CSV. Add dimensions below, then re-convert.</div>';
-    Object.entries(missingSkus).forEach(([sku, itemName]) => {
-      const id = sku.replace(/[^a-zA-Z0-9]/g, '_');
-      html += `<div class="missing-sku-row" id="missing-${id}">
-        <span class="sku-code">${sku}</span>
-        <span style="flex:1;font-size:11px;">${itemName}</span>
-        <input type="number" id="mw-${id}" placeholder="kg" step="0.1" min="0" title="Weight (kg)">
-        <input type="number" id="ml-${id}" placeholder="L cm" step="1" min="0" title="Length (cm)">
-        <input type="number" id="mwd-${id}" placeholder="W cm" step="1" min="0" title="Width (cm)">
-        <input type="number" id="mh-${id}" placeholder="H cm" step="1" min="0" title="Height (cm)">
-        <button class="sku-btn save" onclick="quickAddSku('${sku}','${id}','${itemName.replace(/'/g,"\\'")}')">Save</button>
-      </div>`;
-    });
-    html += '</div>';
-  }
-
-  // Zone B info (included in CSV, just flagged)
-  if (zoneB.length) {
-    html += '<div style="margin-top:1rem;"><div class="card-title" style="color:var(--blue);">Zone B / Out-of-Area — included</div>';
-    html += zoneB.map(z =>
-      `<div class="result-row" style="font-size:13px;background:var(--blue-bg);border-color:var(--blue);"><span class="badge" style="background:var(--blue-bg);color:var(--blue);">${z.postcode}</span><span class="fname">${z.order}</span><span class="skus">${z.name} — ${z.reason}</span></div>`
-    ).join('');
-    html += '</div>';
-  }
-
-  section.innerHTML = html;
-  section.style.display = 'block';
-  document.getElementById('process-btn').style.display = 'none';
-  document.getElementById('reset-btn').style.display = 'block';
-  loadSkuTable(); // refresh SKU table
-}
-
-// ── SKU Dimensions Management ──
-async function loadSkuTable() {
-  const wrap = document.getElementById('sku-table-wrap');
-  if (!wrap) return;
-  try {
-    const res = await fetch('/sku-dimensions');
-    const skus = await res.json();
-    if (!skus.length) {
-      wrap.innerHTML = `<div class="sku-empty">No SKU dimensions saved yet. Add your first SKU below, or convert a CSV to see which SKUs are missing.</div>
-        <div style="margin-top:0.5rem;" id="sku-add-inline">${skuAddRowHtml()}</div>`;
-      return;
-    }
-    let html = '<table class="sku-table"><thead><tr><th>SKU</th><th>Item Name</th><th>Weight (kg)</th><th>L (cm)</th><th>W (cm)</th><th>H (cm)</th><th></th></tr></thead><tbody>';
-    skus.forEach(s => {
-      html += `<tr id="skurow-${s.sku.replace(/[^a-zA-Z0-9]/g,'_')}">
-        <td style="font-weight:600;">${s.sku}</td>
-        <td>${s.item_name || ''}</td>
-        <td>${s.weight_kg}</td>
-        <td>${s.length_cm}</td>
-        <td>${s.width_cm}</td>
-        <td>${s.height_cm}</td>
-        <td><button class="sku-btn del" onclick="deleteSku('${s.sku}')">Delete</button></td>
-      </tr>`;
-    });
-    html += '</tbody></table>';
-    html += `<div style="margin-top:0.75rem;" id="sku-add-inline">${skuAddRowHtml()}</div>`;
-    wrap.innerHTML = html;
-  } catch(e) {
-    wrap.innerHTML = '<div class="sku-empty">Could not load SKU dimensions.</div>';
-  }
-}
-
-function skuAddRowHtml() {
-  return `<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-    <input type="text" id="new-sku" placeholder="SKU code" style="width:120px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
-    <input type="text" id="new-sku-name" placeholder="Item name" style="flex:1;min-width:100px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
-    <input type="number" id="new-sku-w" placeholder="kg" step="0.1" min="0" style="width:65px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
-    <input type="number" id="new-sku-l" placeholder="L cm" step="1" min="0" style="width:65px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
-    <input type="number" id="new-sku-wd" placeholder="W cm" step="1" min="0" style="width:65px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
-    <input type="number" id="new-sku-h" placeholder="H cm" step="1" min="0" style="width:65px;padding:5px 8px;border:1px solid var(--border);border-radius:5px;font-size:12px;">
-    <button class="sku-btn add" onclick="addSku()">+ Add</button>
-  </div>`;
-}
-
-async function addSku() {
-  const sku = document.getElementById('new-sku').value.trim();
-  if (!sku) { alert('Enter a SKU code'); return; }
-  const body = {
-    sku: sku,
-    item_name: document.getElementById('new-sku-name').value.trim(),
-    weight_kg: parseFloat(document.getElementById('new-sku-w').value) || 0,
-    length_cm: parseFloat(document.getElementById('new-sku-l').value) || 0,
-    width_cm: parseFloat(document.getElementById('new-sku-wd').value) || 0,
-    height_cm: parseFloat(document.getElementById('new-sku-h').value) || 0
-  };
-  try {
-    const res = await fetch('/sku-dimensions', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    const data = await res.json();
-    if (data.error) { alert(data.error); return; }
-    loadSkuTable();
-  } catch(e) { alert('Failed to save: ' + e.message); }
-}
-
-async function deleteSku(sku) {
-  if (!confirm('Delete dimensions for ' + sku + '?')) return;
-  try {
-    await fetch('/sku-dimensions/' + encodeURIComponent(sku), { method: 'DELETE' });
-    loadSkuTable();
-  } catch(e) { alert('Failed to delete: ' + e.message); }
-}
-
-async function quickAddSku(sku, id, itemName) {
-  const body = {
-    sku: sku,
-    item_name: itemName,
-    weight_kg: parseFloat(document.getElementById('mw-' + id).value) || 0,
-    length_cm: parseFloat(document.getElementById('ml-' + id).value) || 0,
-    width_cm: parseFloat(document.getElementById('mwd-' + id).value) || 0,
-    height_cm: parseFloat(document.getElementById('mh-' + id).value) || 0
-  };
-  if (!body.weight_kg) { alert('Please enter at least the weight'); return; }
-  try {
-    const res = await fetch('/sku-dimensions', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    const data = await res.json();
-    if (data.error) { alert(data.error); return; }
-    const row = document.getElementById('missing-' + id);
-    if (row) { row.style.background = 'var(--green-bg)'; row.innerHTML = `<span class="sku-code">${sku}</span><span style="flex:1;color:var(--green);font-weight:600;">Saved — ${body.weight_kg}kg, ${body.length_cm}×${body.width_cm}×${body.height_cm}cm</span>`; }
-    loadSkuTable();
-  } catch(e) { alert('Failed to save: ' + e.message); }
-}
-
-// ── Tracking Template Management ──
-async function loadTemplateStatus() {
-  const el = document.getElementById('template-status');
-  if (!el) return;
-  try {
-    const res = await fetch('/tracking-templates');
-    const templates = await res.json();
-    let badges = '<span style="display:inline-block;background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px;">Tesco — built-in ✓</span>';
-    badges += '<span style="display:inline-block;background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px;">B&Q — built-in ✓</span>';
-    if (templates.length) {
-      badges = templates.map(t => {
-        const date = new Date(t.uploaded_at).toLocaleDateString('en-GB', {day:'2-digit',month:'short',year:'numeric'});
-        return `<span style="display:inline-block;background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px;">${t.marketplace === 'bnq' ? 'B&Q' : 'Tesco'} — custom override ${date}</span>`;
-      }).join('');
-    }
-    el.innerHTML = badges;
-  } catch(e) { el.textContent = 'Templates: built-in ✓'; }
-}
-
-async function uploadTemplate(marketplace, input) {
-  const file = input.files[0];
-  if (!file) return;
-  const form = new FormData();
-  form.append('marketplace', marketplace);
-  form.append('file', file);
-  try {
-    const res = await fetch('/tracking-template', { method: 'POST', body: form });
-    const data = await res.json();
-    if (data.error) { alert(data.error); return; }
-    input.value = '';
-    loadTemplateStatus();
-  } catch(e) { alert('Upload failed: ' + e.message); }
 }
 
 async function pollStatus() {
@@ -683,7 +394,6 @@ function resetApp() {
   renderFileList();
   document.getElementById('progress-section').style.display = 'none';
   document.getElementById('results-section').style.display = 'none';
-  document.getElementById('mirakl-results').style.display = 'none';
   document.getElementById('progress-bar').style.width = '0%';
   const btn = document.getElementById('process-btn');
   btn.disabled = false;
