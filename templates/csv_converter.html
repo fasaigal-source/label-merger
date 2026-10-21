@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CSV Converter — M4 Mart</title>
+<style>
+  :root {
+    --bg: #f5f4f0;
+    --card: #ffffff;
+    --border: #e2e0d8;
+    --text: #1a1916;
+    --muted: #7a7870;
+    --accent: #1a1916;
+    --accent-fg: #ffffff;
+    --green: #166534;
+    --green-bg: #dcfce7;
+    --red: #991b1b;
+    --red-bg: #fee2e2;
+    --amber: #92400e;
+    --amber-bg: #fef3c7;
+    --blue: #1e40af;
+    --blue-bg: #dbeafe;
+    --radius: 10px;
+    --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  header { background: var(--accent); color: var(--accent-fg); padding: 0 2rem; height: 56px; display: flex; align-items: center; justify-content: space-between; }
+  header .brand { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  header .sub { font-size: 12px; opacity: 0.5; margin-top: 1px; }
+  header nav { display: flex; gap: 6px; }
+  header nav a { font-size: 12px; color: var(--accent-fg); text-decoration: none; padding: 5px 12px; border-radius: 20px; opacity: 0.7; transition: all 0.15s; }
+  header nav a:hover, header nav a.active { opacity: 1; background: rgba(255,255,255,0.15); }
+  main { max-width: 760px; margin: 0 auto; padding: 2.5rem 1.5rem; }
+  h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.03em; margin-bottom: 6px; }
+  .subtitle { font-size: 14px; color: var(--muted); margin-bottom: 2rem; line-height: 1.6; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 1.5rem; margin-bottom: 1.25rem; }
+  .card-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 1rem; }
+  .modebar { display: flex; gap: 6px; margin-bottom: 1rem; }
+  .modebtn { flex: 1; padding: 10px 12px; font-size: 13px; font-weight: 600; cursor: pointer; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--muted); transition: all 0.15s; text-align: center; }
+  .modebtn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  #drop-zone { border: 2px dashed var(--border); border-radius: var(--radius); padding: 3rem 1.5rem; text-align: center; cursor: pointer; transition: all 0.15s; background: var(--bg); }
+  #drop-zone:hover, #drop-zone.over { border-color: var(--accent); background: #f0efea; }
+  .drop-icon { width: 48px; height: 48px; background: var(--accent); border-radius: 12px; display: flex; align-items: center; justify-content: center; margin: 0 auto 1rem; }
+  .drop-icon svg { width: 24px; height: 24px; stroke: white; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .drop-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .drop-sub { font-size: 13px; color: var(--muted); }
+  #file-list { margin-top: 1rem; display: flex; flex-direction: column; gap: 5px; }
+  .file-chip { display: flex; align-items: center; gap: 8px; padding: 7px 10px; background: var(--blue-bg); border-radius: 7px; font-size: 12px; color: var(--blue); }
+  .file-chip span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .file-chip button { border: none; background: none; cursor: pointer; color: var(--blue); font-size: 14px; padding: 0 2px; line-height: 1; opacity: 0.6; }
+  .file-chip button:hover { opacity: 1; }
+  .options-row { display: flex; align-items: center; gap: 12px; margin-top: 1rem; padding: 10px 14px; background: var(--bg); border-radius: 8px; }
+  .options-row label { font-size: 13px; color: var(--text); cursor: pointer; display: flex; align-items: center; gap: 6px; }
+  .options-row input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+  #convert-btn { width: 100%; padding: 13px; background: var(--accent); color: white; border: none; border-radius: var(--radius); font-size: 14px; font-weight: 600; cursor: pointer; margin-top: 1rem; transition: opacity 0.15s; display: none; align-items: center; justify-content: center; gap: 8px; }
+  #convert-btn:hover { opacity: 0.88; }
+  #convert-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .spinner { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.6s linear infinite; display: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 1.25rem; }
+  .stat { background: var(--bg); border-radius: 8px; padding: 12px 14px; text-align: center; }
+  .stat-num { font-size: 24px; font-weight: 700; letter-spacing: -0.03em; }
+  .stat-lbl { font-size: 11px; color: var(--muted); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat.ok .stat-num { color: var(--green); }
+  .stat.warn .stat-num { color: var(--amber); }
+  .stat.err .stat-num { color: var(--red); }
+  .dl-btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 24px; background: var(--green); color: white; border: none; border-radius: var(--radius); font-size: 14px; font-weight: 700; cursor: pointer; text-decoration: none; transition: opacity 0.15s; }
+  .dl-btn:hover { opacity: 0.88; }
+  .zone-b-list { margin-top: 10px; font-size: 12px; }
+  .zone-b-item { padding: 6px 10px; background: var(--amber-bg); color: var(--amber); border-radius: 6px; margin-bottom: 4px; }
+  .missing-sku-list { margin-top: 10px; font-size: 12px; }
+  .missing-sku-item { padding: 6px 10px; background: var(--red-bg); color: var(--red); border-radius: 6px; margin-bottom: 4px; display: flex; justify-content: space-between; }
+  .info-box { padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 10px; }
+  .info-box.amber { background: var(--amber-bg); color: var(--amber); }
+  .info-box.blue { background: var(--blue-bg); color: var(--blue); }
+  .info-box.red { background: var(--red-bg); color: var(--red); }
+  #results-section { display: none; }
+  #reset-btn { width: 100%; padding: 10px; background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: var(--radius); font-size: 13px; cursor: pointer; margin-top: 8px; transition: background 0.1s; }
+  #reset-btn:hover { background: var(--bg); color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="brand">M4 Mart</div>
+    <div class="sub">CSV Converter</div>
+  </div>
+  <nav>
+    <a href="/">Label Merger</a>
+    <a href="/csv-converter" class="active">CSV Converter</a>
+  </nav>
+</header>
+
+<main>
+  <h1>CSV Converter</h1>
+  <p class="subtitle">Convert order export CSVs into Evri bulk-upload format. Choose a source below, upload the file, and download the ready-to-upload Evri CSV.</p>
+
+  <div class="card">
+    <div class="card-title">Source format</div>
+    <div class="modebar">
+      <button type="button" class="modebtn active" id="mode-shopify" onclick="setMode('shopify')">Shopify</button>
+      <button type="button" class="modebtn" id="mode-amazon" onclick="setMode('amazon')">Amazon</button>
+      <button type="button" class="modebtn" id="mode-mirakl" onclick="setMode('mirakl')">Mirakl (Tesco / B&Q)</button>
+    </div>
+
+    <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+      <input type="file" id="file-input" accept=".csv" multiple hidden>
+      <div class="drop-icon"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></div>
+      <div class="drop-title">Drop CSV files here</div>
+      <div class="drop-sub" id="drop-sub">Shopify orders export <strong>CSV</strong> files</div>
+    </div>
+    <div id="file-list"></div>
+
+    <div class="options-row" id="shopify-options">
+      <label><input type="checkbox" id="filter-unfulfilled" checked> Only unfulfilled orders</label>
+    </div>
+
+    <button id="convert-btn" onclick="startConvert()">
+      <span class="spinner" id="btn-spinner"></span>
+      Convert to Evri CSV
+    </button>
+  </div>
+
+  <div class="card" id="results-section">
+    <div class="card-title">Results</div>
+    <div id="results-content"></div>
+  </div>
+
+  <button id="reset-btn" onclick="resetAll()" style="display:none;">Start over</button>
+</main>
+
+<script>
+let uploadMode = 'shopify';
+let selectedFiles = [];
+
+function setMode(m) {
+  uploadMode = m;
+  document.getElementById('mode-shopify').classList.toggle('active', m === 'shopify');
+  document.getElementById('mode-amazon').classList.toggle('active', m === 'amazon');
+  document.getElementById('mode-mirakl').classList.toggle('active', m === 'mirakl');
+  document.getElementById('shopify-options').style.display = (m === 'shopify' || m === 'amazon') ? 'flex' : 'none';
+
+  const filterLabel = document.querySelector('#shopify-options label');
+  if (m === 'amazon') {
+    filterLabel.innerHTML = '<input type="checkbox" id="filter-unfulfilled" checked> Only awaiting fulfilment';
+  } else {
+    filterLabel.innerHTML = '<input type="checkbox" id="filter-unfulfilled" checked> Only unfulfilled orders';
+  }
+
+  const dropSub = document.getElementById('drop-sub');
+  if (m === 'shopify') {
+    dropSub.innerHTML = 'Shopify orders export <strong>CSV</strong> files';
+  } else if (m === 'amazon') {
+    dropSub.innerHTML = 'Amazon orders export <strong>CSV</strong> files (Linnworks / channel manager)';
+  } else {
+    dropSub.innerHTML = 'Mirakl order export <strong>CSV</strong> files (Tesco or B&Q)';
+  }
+
+  // Clear files on mode switch
+  selectedFiles = [];
+  renderFileList();
+  document.getElementById('results-section').style.display = 'none';
+}
+
+// ── File handling ──
+
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('over');
+  addFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', () => { addFiles(fileInput.files); fileInput.value = ''; });
+
+function addFiles(fileList) {
+  for (const f of fileList) {
+    if (f.name.toLowerCase().endsWith('.csv') && !selectedFiles.some(s => s.name === f.name && s.size === f.size)) {
+      selectedFiles.push(f);
+    }
+  }
+  renderFileList();
+}
+
+function removeFile(idx) {
+  selectedFiles.splice(idx, 1);
+  renderFileList();
+}
+
+function renderFileList() {
+  const list = document.getElementById('file-list');
+  const btn = document.getElementById('convert-btn');
+  list.innerHTML = selectedFiles.map((f, i) =>
+    `<div class="file-chip"><span>${f.name}</span><button onclick="removeFile(${i})">✕</button></div>`
+  ).join('');
+  btn.style.display = selectedFiles.length ? 'flex' : 'none';
+}
+
+// ── Convert ──
+
+async function startConvert() {
+  const btn = document.getElementById('convert-btn');
+  const spinner = document.getElementById('btn-spinner');
+  btn.disabled = true;
+  spinner.style.display = 'block';
+
+  const form = new FormData();
+  selectedFiles.forEach(f => form.append('files', f));
+
+  let endpoint, downloadBase;
+  if (uploadMode === 'shopify') {
+    endpoint = '/convert-shopify';
+    downloadBase = '/download-shopify-csv/';
+    form.append('filter_unfulfilled', document.getElementById('filter-unfulfilled').checked ? 'true' : 'false');
+  } else if (uploadMode === 'amazon') {
+    endpoint = '/convert-amazon';
+    downloadBase = '/download-amazon-csv/';
+    form.append('filter_unfulfilled', document.getElementById('filter-unfulfilled').checked ? 'true' : 'false');
+  } else {
+    endpoint = '/convert-mirakl';
+    downloadBase = '/download-evri-csv/';
+  }
+
+  try {
+    const res = await fetch(endpoint, { method: 'POST', body: form });
+    const data = await res.json();
+    if (!res.ok) {
+      showError(data.error || 'Conversion failed');
+      return;
+    }
+    showResults(data, downloadBase);
+  } catch (e) {
+    showError('Network error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    spinner.style.display = 'none';
+  }
+}
+
+function showError(msg) {
+  const section = document.getElementById('results-section');
+  const content = document.getElementById('results-content');
+  section.style.display = 'block';
+  content.innerHTML = `<div class="info-box red">${msg}</div>`;
+  document.getElementById('reset-btn').style.display = 'block';
+}
+
+function showResults(data, downloadBase) {
+  const section = document.getElementById('results-section');
+  const content = document.getElementById('results-content');
+  const s = data.stats;
+
+  let html = `<div class="stats-grid">
+    <div class="stat ok"><div class="stat-num">${s.converted_rows}</div><div class="stat-lbl">Evri rows</div></div>
+    <div class="stat"><div class="stat-num">${s.total_orders}</div><div class="stat-lbl">Orders</div></div>
+    <div class="stat ${s.zone_b ? 'warn' : ''}"><div class="stat-num">${s.zone_b}</div><div class="stat-lbl">Zone B</div></div>
+  </div>`;
+
+  // Extra stats
+  if (s.fulfilled_skipped) {
+    html += `<div class="info-box blue">Skipped ${s.fulfilled_skipped} already-fulfilled order${s.fulfilled_skipped !== 1 ? 's' : ''}</div>`;
+  }
+  if (s.duplicates) {
+    html += `<div class="info-box blue">Removed ${s.duplicates} duplicate order${s.duplicates !== 1 ? 's' : ''} across files</div>`;
+  }
+  if (s.dims_missing) {
+    html += `<div class="info-box amber">⚠ ${s.dims_missing} row${s.dims_missing !== 1 ? 's' : ''} missing weight/dimensions — add SKUs in <a href="/" style="color:inherit;text-decoration:underline;">Label Merger</a></div>`;
+  }
+
+  // Zone B list
+  if (data.zone_b && data.zone_b.length) {
+    html += `<div class="zone-b-list"><strong style="font-size:12px;">Zone B / out-of-area orders (included in CSV):</strong>`;
+    data.zone_b.forEach(z => {
+      html += `<div class="zone-b-item">${z.order} — ${z.name} — ${z.postcode} (${z.reason})</div>`;
+    });
+    html += `</div>`;
+  }
+
+  // Missing SKUs
+  if (data.missing_skus && Object.keys(data.missing_skus).length) {
+    html += `<div class="missing-sku-list"><strong style="font-size:12px;">SKUs missing dimensions:</strong>`;
+    for (const [sku, name] of Object.entries(data.missing_skus)) {
+      html += `<div class="missing-sku-item"><span>${sku}</span><span style="opacity:0.7;">${name}</span></div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Download button
+  html += `<div style="margin-top:1.25rem;text-align:center;">
+    <a class="dl-btn" href="${downloadBase}${data.job_id}" download>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Download Evri CSV
+    </a>
+  </div>`;
+
+  content.innerHTML = html;
+  section.style.display = 'block';
+  document.getElementById('reset-btn').style.display = 'block';
+}
+
+function resetAll() {
+  selectedFiles = [];
+  renderFileList();
+  document.getElementById('results-section').style.display = 'none';
+  document.getElementById('reset-btn').style.display = 'none';
+}
+</script>
+</body>
+</html>

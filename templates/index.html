@@ -30,6 +30,9 @@
   header .brand { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
   header .sub { font-size: 12px; opacity: 0.5; margin-top: 1px; }
   header .tag { font-size: 11px; background: rgba(255,255,255,0.12); padding: 3px 10px; border-radius: 20px; }
+  header nav { display: flex; gap: 6px; }
+  header nav a { font-size: 12px; color: var(--accent-fg); text-decoration: none; padding: 5px 12px; border-radius: 20px; opacity: 0.7; transition: all 0.15s; }
+  header nav a:hover, header nav a.active { opacity: 1; background: rgba(255,255,255,0.15); }
   main { max-width: 760px; margin: 0 auto; padding: 2.5rem 1.5rem; }
   h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.03em; margin-bottom: 6px; }
   .subtitle { font-size: 14px; color: var(--muted); margin-bottom: 2rem; line-height: 1.6; }
@@ -132,7 +135,10 @@
     <div class="brand">Label Merger</div>
     <div class="sub">M4 Mart — Pillow Factory</div>
   </div>
-  <div class="tag">Evri · Amazon</div>
+  <nav>
+    <a href="/" class="active">Label Merger</a>
+    <a href="/csv-converter">CSV Converter</a>
+  </nav>
 </header>
 <main>
   <h1>Shipping Label + Pick List</h1>
