@@ -1470,6 +1470,266 @@ def process_easyship(job_id, pdf_files, tmpdir):
             jobs[job_id]['curtain_count'] = curtain_count
 
 
+def process_evri_direct(job_id, pdf_files, tmpdir):
+    """Job runner for the Evri Direct tab.
+
+    Evri Direct PDFs alternate pages: odd pages (0, 2, 4 …) are shipping
+    labels, even pages (1, 3, 5 …) are packing slips.  Both have text
+    layers so no OCR is needed — we use pdfplumber / pypdf to read them.
+
+    Pipeline:
+      1. Pair label + packing-slip pages
+      2. Extract SKU/Qty from packing-slip text
+      3. Extract postcode from label text → postcode checker
+      4. Extract Amazon order ID from label text (Reference 2 field)
+      5. Resolve SKU aliases via get_canonical_sku()
+      6. Sort entries by SKU, separate curtain labels (6004-*)
+      7. Stamp each label page with create_evri_overlay()
+      8. Strip packing-slip pages (only label pages go into the output)
+      9. Build pick list, save to DB, report results
+    """
+    def update(progress, message):
+        with jobs_lock:
+            jobs[job_id]['progress'] = progress
+            jobs[job_id]['message'] = message
+
+    update(0, 'Reading Evri Direct labels...')
+    run_label = datetime.now(ZoneInfo('Europe/London')).strftime('%H%M')
+
+    page_entries = []   # one entry per label page (order)
+
+    for path in pdf_files:
+        try:
+            plumb_pdf = pdfplumber.open(path)
+            pypdf_reader = PdfReader(str(path))
+            n_pages = len(plumb_pdf.pages)
+
+            # Pair pages: label at even index, packing slip at odd index
+            for label_idx in range(0, n_pages, 2):
+                slip_idx = label_idx + 1
+                print(f"EvriDirect: {Path(path).name} label page {label_idx+1}, "
+                      f"slip page {slip_idx+1 if slip_idx < n_pages else 'N/A'}")
+
+                # --- Extract SKU/Qty from packing slip ---
+                items = []
+                if slip_idx < n_pages:
+                    slip_text = plumb_pdf.pages[slip_idx].extract_text() or ''
+                    # pypdf often gives cleaner spacing for the item rows
+                    try:
+                        pypdf_slip_text = pypdf_reader.pages[slip_idx].extract_text() or ''
+                    except Exception:
+                        pypdf_slip_text = slip_text
+
+                    # Parse item lines after the "Qty SKU Name" header.
+                    # Format: "1 HF-13.5D Sleep&Snuggle..." or
+                    #         "5 S_pt_BD Sleep & Snuggle..."
+                    # Use the pypdf text first (better spacing), fall back to
+                    # pdfplumber text.
+                    for src_text in [pypdf_slip_text, slip_text]:
+                        if items:
+                            break
+                        # Find the header line, then parse rows after it
+                        lines = src_text.split('\n')
+                        parsing = False
+                        for line in lines:
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            # Detect header (may have spaces collapsed)
+                            if re.search(r'Qty\s*SKU\s*Name', stripped, re.IGNORECASE):
+                                parsing = True
+                                continue
+                            if parsing:
+                                # Each item line starts with qty (digits) then SKU
+                                m = re.match(r'(\d+)\s+(\S+)', stripped)
+                                if m:
+                                    qty = int(m.group(1))
+                                    raw_sku = m.group(2)
+                                    canonical_sku, was_mapped = get_canonical_sku(raw_sku)
+                                    it = {'sku': canonical_sku, 'qty': qty}
+                                    if was_mapped:
+                                        it['raw_sku'] = raw_sku
+                                    items.append(it)
+
+                # --- Extract postcode and order ID from label page ---
+                label_text = ''
+                try:
+                    label_text = pypdf_reader.pages[label_idx].extract_text() or ''
+                except Exception:
+                    pass
+                if not label_text:
+                    try:
+                        label_text = plumb_pdf.pages[label_idx].extract_text() or ''
+                    except Exception:
+                        pass
+
+                # Order ID from "Reference 2 <id>" on the label
+                order_id = ''
+                ref_m = re.search(r'Reference\s*2\s+(\S+)', label_text)
+                if ref_m:
+                    order_id = ref_m.group(1)
+
+                # Postcode check
+                pc_result = check_label_postcode(text=label_text)
+
+                page_entries.append({
+                    'path': path,
+                    'index': label_idx,
+                    'items': items,
+                    'order_id': order_id,
+                    'sort_key': items[0]['sku'].upper() if items else 'ZZZZ',
+                    'pc_result': pc_result,
+                })
+
+            plumb_pdf.close()
+        except Exception as e:
+            page_entries.append({
+                'path': path, 'index': 0, 'items': [], 'order_id': '',
+                'error': str(e), 'sort_key': 'ZZZZ',
+                'pc_result': {'postcode': None, 'flagged': False,
+                              'warning': True, 'exclude': True,
+                              'reason': 'PDF read error', 'ocr_guess': None},
+            })
+
+    error_entries = [e for e in page_entries if e.get('error')]
+    included_entries = [e for e in page_entries if not e.get('error') and not e['pc_result'].get('exclude')]
+    excluded_entries = [e for e in page_entries if not e.get('error') and e['pc_result'].get('exclude')]
+    total_labels = max(len(page_entries), 1)
+
+    update(30, 'Sorting by SKU...')
+    included_entries.sort(key=lambda e: e['sort_key'])
+
+    # --- Separate curtain labels (SKU starts with 6004-) ---
+    curtain_entries = [e for e in included_entries if
+                       any(it['sku'].upper().startswith('6004-') for it in e.get('items', []) if it.get('sku'))]
+    main_entries = [e for e in included_entries if e not in curtain_entries]
+
+    # Build pick list from ALL included entries (curtains + main)
+    pick_list = build_pick_list(included_entries)
+
+    writer = PdfWriter()
+    curtain_writer = PdfWriter() if curtain_entries else None
+
+    if pick_list:
+        pick_list_buf = create_pick_list_page(pick_list, run_label, len(included_entries))
+        for pg in PdfReader(pick_list_buf).pages:
+            writer.add_page(pg)
+
+    results = []
+    page_num = 0
+    total_included = len(included_entries)
+
+    for i, ent in enumerate(included_entries):
+        update(35 + int((i / max(total_included, 1)) * 55),
+               'Stamping ' + str(i + 1) + '/' + str(total_included))
+        fname = Path(ent['path']).name
+        is_curtain = ent in curtain_entries
+        page_num += 1
+        try:
+            reader = PdfReader(str(ent['path']))
+            page = reader.pages[ent['index']]
+            pw = float(page.mediabox.width)
+            ph = float(page.mediabox.height)
+
+            if ent['items']:
+                overlay = create_evri_overlay(
+                    ent['items'], ent.get('order_id', ''),
+                    page_num, total_included, run_label,
+                    pw, ph, warn=False
+                )
+                page.merge_page(PdfReader(overlay).pages[0])
+
+            if is_curtain:
+                curtain_writer.add_page(page)
+            else:
+                writer.add_page(page)
+
+            has_sku = bool(ent['items'])
+            results.append({
+                'file': fname, 'status': 'ok',
+                'items': ent['items'] or [{'sku': '(no SKU read)', 'qty': '?'}],
+                'order_id': ent.get('order_id', ''),
+                'page': page_num, 'batch': run_label,
+                'carrier': 'Evri · Direct',
+                'needs_check': not has_sku,
+                'warn_reason': None if has_sku else 'could not read SKU/Qty from packing slip',
+                'is_curtain': is_curtain,
+                'postcode': ent['pc_result'].get('postcode', ''),
+            })
+        except Exception as e:
+            results.append({'file': fname, 'status': 'error', 'error': str(e),
+                            'needs_check': False, 'warn_reason': None})
+
+    # Excluded (postcode flagged/warning) entries
+    for ent in excluded_entries:
+        fname = Path(ent['path']).name
+        pc = ent['pc_result']
+        results.append({
+            'file': fname, 'status': 'excluded',
+            'items': ent['items'] or [{'sku': '(no SKU read)', 'qty': '?'}],
+            'order_id': ent.get('order_id', ''),
+            'page': 0, 'batch': run_label,
+            'carrier': 'Evri · Direct',
+            'needs_check': True,
+            'warn_reason': pc.get('reason') or ('postcode unreadable' if pc.get('warning') else 'out of area'),
+            'postcode': pc.get('postcode', ''),
+            'flagged': pc.get('flagged', False),
+        })
+
+    for ent in error_entries:
+        fname = Path(ent['path']).name
+        results.append({'file': fname, 'status': 'error', 'error': ent['error'],
+                        'needs_check': False, 'warn_reason': None})
+
+    update(95, 'Saving PDF...')
+    out_path = os.path.join(tmpdir, 'labels_evridirect_' + job_id + '.pdf')
+    with open(out_path, 'wb') as f:
+        writer.write(f)
+
+    ok_count = len([r for r in results if r['status'] == 'ok'])
+    excluded_count = len(excluded_entries)
+    warn_count = len([r for r in results if r.get('needs_check')])
+    ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
+    download_name = 'labels_batch' + run_label + '_' + ts + '.pdf'
+
+    with open(out_path, 'rb') as f:
+        save_label_file(job_id, 'evri_direct', run_label, download_name, f.read())
+    save_pick_list_entries(job_id, 'evri_direct', run_label, pick_list)
+
+    # Save curtain labels as a separate downloadable PDF if any exist
+    curtains_job_id = None
+    curtain_count = len(curtain_entries)
+    if curtain_writer and curtain_count > 0:
+        curtains_job_id = job_id + '_curtains'
+        curtain_path = os.path.join(tmpdir, 'curtains_evridirect_' + job_id + '.pdf')
+        with open(curtain_path, 'wb') as f:
+            curtain_writer.write(f)
+        curtain_download_name = 'curtains_batch' + run_label + '_' + ts + '.pdf'
+        with open(curtain_path, 'rb') as f:
+            save_label_file(curtains_job_id, 'evri_direct', run_label,
+                            curtain_download_name, f.read())
+
+    with jobs_lock:
+        jobs[job_id]['status'] = 'done'
+        jobs[job_id]['progress'] = 100
+        msg = 'Batch ' + run_label + ' done — ' + str(ok_count) + '/' + str(total_labels) + ' labels merged'
+        if excluded_count:
+            msg += ' — 🚫 ' + str(excluded_count) + ' excluded (postcode)'
+        if curtain_count:
+            msg += ' — 🪟 ' + str(curtain_count) + ' curtain label' + ('s' if curtain_count != 1 else '') + ' separated'
+        if warn_count:
+            msg += ' — ⚠ ' + str(warn_count) + ' need checking'
+        jobs[job_id]['message'] = msg
+        jobs[job_id]['result_path'] = out_path
+        jobs[job_id]['results'] = results
+        jobs[job_id]['batch_id'] = run_label
+        jobs[job_id]['download_name'] = download_name
+        jobs[job_id]['pick_list'] = pick_list
+        if curtains_job_id:
+            jobs[job_id]['curtains_job_id'] = curtains_job_id
+            jobs[job_id]['curtain_count'] = curtain_count
+
+
 def process_thirdparty(job_id, pdf_files, tmpdir):
     """Job runner for the 3rd-party tab: one page = one finished label."""
     def update(progress, message):
@@ -1694,6 +1954,8 @@ def upload():
         target = process_thirdparty
     elif mode == 'easyship':
         target = process_easyship
+    elif mode == 'evri_direct':
+        target = process_evri_direct
     else:
         target = run_job
     t = threading.Thread(target=target, args=(job_id, pdf_files, tmpdir))
