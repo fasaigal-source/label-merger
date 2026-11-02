@@ -1409,6 +1409,14 @@ def process_easyship(job_id, pdf_files, tmpdir):
     update(30, 'Sorting by SKU...')
     included_entries.sort(key=lambda e: e['sort_key'])
 
+    # --- Separate curtain labels (SKU starts with 6004-) from the rest ---
+    curtain_entries = [e for e in included_entries if
+                       any(it['sku'].upper().startswith('6004-') for it in e.get('items', []) if it.get('sku'))]
+    main_entries = [e for e in included_entries if e not in curtain_entries]
+
+    # Build pick list from ALL included entries (curtains + main) so the
+    # overall pick list is complete — the picker still needs to see what's
+    # in the batch even though curtain labels print separately.
     pick_list = build_pick_list(included_entries)
 
     # Pick list is always 4x6, same as the other tabs, regardless of the
@@ -1416,6 +1424,7 @@ def process_easyship(job_id, pdf_files, tmpdir):
     # only the pick-list summary page is fixed at 4x6, printed on the same
     # stock as everything else rather than as an A4 page mixed into the batch).
     writer = PdfWriter()
+    curtain_writer = PdfWriter() if curtain_entries else None
     if pick_list:
         pick_list_buf = create_pick_list_page(pick_list, run_label, len(included_entries))
         for pg in PdfReader(pick_list_buf).pages:
@@ -1427,6 +1436,7 @@ def process_easyship(job_id, pdf_files, tmpdir):
         update(35 + int((i / max(len(included_entries), 1)) * 55),
                'Stamping ' + str(i + 1) + '/' + str(len(included_entries)))
         fname = Path(ent['path']).name
+        is_curtain = ent in curtain_entries
         try:
             reader = PdfReader(str(ent['path']))
             page = reader.pages[ent['index']]
@@ -1436,7 +1446,12 @@ def process_easyship(job_id, pdf_files, tmpdir):
                 overlay_rows = [(it['sku'], it['qty']) for it in ent['items']]
                 ov = create_easyship_overlay(overlay_rows, pw, ph)
                 page.merge_page(PdfReader(ov).pages[0])
-            writer.add_page(page)
+
+            # Route the stamped page to the correct writer
+            if is_curtain:
+                curtain_writer.add_page(page)
+            else:
+                writer.add_page(page)
 
             has_sku = bool(ent['items'])
             results.append({
@@ -1445,7 +1460,8 @@ def process_easyship(job_id, pdf_files, tmpdir):
                 'order_id': '', 'page': i + 1, 'batch': run_label,
                 'carrier': 'Evri · Easy Ship',
                 'needs_check': not has_sku,
-                'warn_reason': None if has_sku else 'could not read SKU/Qty line'
+                'warn_reason': None if has_sku else 'could not read SKU/Qty line',
+                'is_curtain': is_curtain
             })
         except Exception as e:
             results.append({'file': fname, 'status': 'error', 'error': str(e),
@@ -1470,10 +1486,25 @@ def process_easyship(job_id, pdf_files, tmpdir):
         save_label_file(job_id, 'easyship', run_label, download_name, f.read())
     save_pick_list_entries(job_id, 'easyship', run_label, pick_list)
 
+    # Save curtain labels as a separate downloadable PDF if any exist
+    curtains_job_id = None
+    curtain_count = len(curtain_entries)
+    if curtain_writer and curtain_count > 0:
+        curtains_job_id = job_id + '_curtains'
+        curtain_path = os.path.join(tmpdir, 'curtains_easyship_' + job_id + '.pdf')
+        with open(curtain_path, 'wb') as f:
+            curtain_writer.write(f)
+        curtain_download_name = 'curtains_easyship_' + ts + '.pdf'
+        with open(curtain_path, 'rb') as f:
+            save_label_file(curtains_job_id, 'easyship', run_label,
+                            curtain_download_name, f.read())
+
     with jobs_lock:
         jobs[job_id]['status'] = 'done'
         jobs[job_id]['progress'] = 100
         msg = str(ok_count) + '/' + str(total_labels) + ' Easy Ship labels stamped'
+        if curtain_count:
+            msg += ' — 🪟 ' + str(curtain_count) + ' curtain label' + ('s' if curtain_count != 1 else '') + ' separated'
         if warn_count:
             msg += ' — ⚠ ' + str(warn_count) + ' need checking'
         jobs[job_id]['message'] = msg
@@ -1482,6 +1513,9 @@ def process_easyship(job_id, pdf_files, tmpdir):
         jobs[job_id]['batch_id'] = run_label
         jobs[job_id]['download_name'] = download_name
         jobs[job_id]['pick_list'] = pick_list
+        if curtains_job_id:
+            jobs[job_id]['curtains_job_id'] = curtains_job_id
+            jobs[job_id]['curtain_count'] = curtain_count
 
 
 def process_thirdparty(job_id, pdf_files, tmpdir):
