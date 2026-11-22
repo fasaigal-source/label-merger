@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, re, io, csv, json, zipfile, tempfile, threading, uuid, string, html as html_module
+import os, re, io, csv, json, zipfile, tempfile, threading, uuid, string, hashlib, html as html_module
 from openpyxl import Workbook
 from openpyxl.styles import Font
 from pathlib import Path
@@ -144,6 +144,23 @@ def init_db():
                 updated_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
         ''')
+        # Fingerprint of every PDF already processed, per tab, so re-uploading
+        # the exact same file (e.g. while testing) is recognised and skipped
+        # instead of being counted again into the weekly pick-list totals.
+        # Rolling 3-month window, swept by cleanup_old_processed_files().
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS processed_files (
+                id SERIAL PRIMARY KEY,
+                file_hash TEXT NOT NULL,
+                tab TEXT NOT NULL,
+                job_id TEXT,
+                batch_id TEXT,
+                label_count INTEGER NOT NULL DEFAULT 0,
+                filename TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                UNIQUE (file_hash, tab)
+            )
+        ''')
         conn.commit()
         cur.close()
         conn.close()
@@ -208,6 +225,118 @@ def cleanup_old_pick_list_entries():
         conn.close()
     except Exception as e:
         print(f"Pick list history cleanup error: {e}")
+
+
+def cleanup_old_processed_files():
+    """Delete file fingerprints older than 3 months (same rolling window as
+    pick-list history). Keeps duplicate detection effective for recent
+    re-uploads without the table growing forever."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM processed_files WHERE created_at < NOW() - INTERVAL '3 months'")
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Processed-files cleanup error: {e}")
+
+
+# ── DUPLICATE FILE DETECTION ─────────────────────────────────────────────────
+# Re-uploading the exact same PDF (common while testing) used to re-count every
+# SKU into the weekly pick-list totals. We now fingerprint each uploaded file
+# (SHA-256 of its bytes) per tab: a file already seen on the same tab is a
+# duplicate — skipped from this batch and from the pick-list totals — while any
+# genuinely new files in the same upload are still processed normally.
+
+def file_sha256(path):
+    """Content hash of a file's bytes, streamed so large PDFs don't load whole."""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_duplicate_files(pdf_files, tab):
+    """Split uploaded files into (fresh, dups) for this tab.
+
+    fresh : paths to actually process (never seen before on this tab)
+    dups  : list of {filename, batch_id, created_at, label_count} already processed
+
+    Fail-open: on any DB error, treat everything as fresh so a real run is
+    never blocked by the dedup check."""
+    fresh, dups = [], []
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        for p in pdf_files:
+            try:
+                fh = file_sha256(p)
+            except Exception:
+                fresh.append(p)
+                continue
+            cur.execute('SELECT batch_id, created_at, label_count FROM processed_files '
+                        'WHERE file_hash = %s AND tab = %s', (fh, tab))
+            prior = cur.fetchone()
+            if prior:
+                dups.append({'filename': Path(p).name, 'batch_id': prior['batch_id'],
+                             'created_at': prior['created_at'],
+                             'label_count': prior['label_count'] or 0})
+            else:
+                fresh.append(p)
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Duplicate check error: {e}")
+        return list(pdf_files), []
+    return fresh, dups
+
+
+def save_processed_files(pdf_files, tab, job_id, batch_id):
+    """Record the fingerprint of each file just processed, so a later
+    re-upload of the same bytes on the same tab is recognised as a duplicate.
+    label_count is the PDF's page count (a rough 'how big was it' hint for the
+    warning), best-effort only."""
+    if not pdf_files:
+        return
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        for p in pdf_files:
+            try:
+                fh = file_sha256(p)
+            except Exception:
+                continue
+            try:
+                page_count = len(PdfReader(str(p)).pages)
+            except Exception:
+                page_count = 0
+            cur.execute('''
+                INSERT INTO processed_files (file_hash, tab, job_id, batch_id, label_count, filename)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (file_hash, tab) DO UPDATE SET
+                    job_id = EXCLUDED.job_id, batch_id = EXCLUDED.batch_id,
+                    label_count = EXCLUDED.label_count, created_at = NOW()
+            ''', (fh, tab, job_id, batch_id, page_count, Path(p).name))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Save processed files error: {e}")
+
+
+def build_dup_summary(dups):
+    """Turn the duplicate list into a short warning string for the job message."""
+    if not dups:
+        return None
+    n = len(dups)
+    batches = sorted({d['batch_id'] for d in dups if d.get('batch_id')})
+    text = '♻ ' + str(n) + ' file' + ('s' if n != 1 else '') + ' already processed'
+    if batches:
+        text += ' (batch ' + ', '.join(batches) + ')'
+    text += ' — skipped'
+    return {'count': n, 'text': text, 'files': dups}
 
 
 def save_label_file(job_id, tab, batch_id, filename, file_bytes):
@@ -724,6 +853,21 @@ def extract_items_from_pdf(pdf_path):
 
 # ── OVERLAY FUNCTIONS ─────────────────────────────────────────────────────────
 
+def draw_label_batch_stamp(c, page_num, total_pages, batch_id, x=8, y=8):
+    """Stamp the label's page number within the batch and the batch id onto
+    the bottom-left corner. Printed on every label across all tabs so each one
+    can be traced back to its batch and position. No-op when no batch id."""
+    if not batch_id:
+        return
+    if page_num and total_pages:
+        text = 'p' + str(page_num) + '/' + str(total_pages) + '  B:' + str(batch_id)
+    else:
+        text = 'B:' + str(batch_id)
+    c.setFont('Helvetica-Bold', 7)
+    c.setFillColorRGB(0, 0, 0)
+    c.drawString(x, y, text)
+
+
 def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w, page_h, warn=False):
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
@@ -1127,11 +1271,12 @@ def extract_thirdparty_items(plumb_page):
     return items
 
 
-def create_thirdparty_overlay(items, page_w, page_h):
+def create_thirdparty_overlay(items, page_w, page_h, page_num=None, total_pages=None, batch_id=None):
     """Compact SKU/qty box drawn into the empty band inside the label.
     No header; one row per SKU; grows downward and auto-shrinks to fit the band."""
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
+    draw_label_batch_stamp(c, page_num, total_pages, batch_id)
     if not items:
         c.save(); packet.seek(0); return packet
 
@@ -1305,13 +1450,14 @@ def parse_easyship_items(raw_line):
     return items
 
 
-def create_easyship_overlay(items, page_w, page_h):
+def create_easyship_overlay(items, page_w, page_h, page_num=None, total_pages=None, batch_id=None):
     """Big, clear SKU/Qty stamp for Easy Ship labels, drawn at the top of
     the label between 'M4 MART LIMITED' on the left and 'Marketplace / EVRi'
     on the right. SKU and qty share one line per item (e.g. '1818-P4 x 2').
     Auto-shrinks only as far as needed for a long SKU or several items."""
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
+    draw_label_batch_stamp(c, page_num, total_pages, batch_id)
     if not items:
         c.save(); packet.seek(0); return packet
 
@@ -1442,10 +1588,11 @@ def process_easyship(job_id, pdf_files, tmpdir):
             page = reader.pages[ent['index']]
             pw = float(page.mediabox.width)
             ph = float(page.mediabox.height)
-            if ent['items']:
-                overlay_rows = [(it['sku'], it['qty']) for it in ent['items']]
-                ov = create_easyship_overlay(overlay_rows, pw, ph)
-                page.merge_page(PdfReader(ov).pages[0])
+            overlay_rows = [(it['sku'], it['qty']) for it in ent['items']] if ent['items'] else []
+            ov = create_easyship_overlay(overlay_rows, pw, ph,
+                                         page_num=i + 1, total_pages=len(included_entries),
+                                         batch_id=run_label)
+            page.merge_page(PdfReader(ov).pages[0])
 
             # Route the stamped page to the correct writer
             if is_curtain:
@@ -1622,10 +1769,11 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
 
             new_page = PageObject.create_blank_page(width=pw, height=target_h)
             new_page.merge_transformed_page(page, Transformation().translate(0, -shift))
-            if ent['items']:
-                overlay_rows = [(it['sku'], it['qty']) for it in ent['items']]
-                ov = create_thirdparty_overlay(overlay_rows, pw, target_h)
-                new_page.merge_page(PdfReader(ov).pages[0])
+            overlay_rows = [(it['sku'], it['qty']) for it in ent['items']] if ent['items'] else []
+            ov = create_thirdparty_overlay(overlay_rows, pw, target_h,
+                                           page_num=i + 1, total_pages=len(included_entries),
+                                           batch_id=run_label)
+            new_page.merge_page(PdfReader(ov).pages[0])
             writer.add_page(new_page)
 
             has_sku = bool(ent['items'])
@@ -2110,12 +2258,13 @@ def extract_evri_direct_items(plumb_page):
     return items
 
 
-def create_evri_direct_overlay(items, page_w, page_h):
+def create_evri_direct_overlay(items, page_w, page_h, page_num=None, total_pages=None, batch_id=None):
     """Stamp SKU/Qty onto an Evri Direct label in the sender area at the top.
     Similar to the 3rd-party overlay but positioned at the very top of the
     label (the sender/logo region) instead of mid-label."""
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
+    draw_label_batch_stamp(c, page_num, total_pages, batch_id)
     if not items:
         c.save(); packet.seek(0); return packet
 
@@ -2268,9 +2417,19 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
     update(35, 'Sorting by SKU...')
     included_entries.sort(key=lambda e: e['sort_key'])
 
+    # --- Separate curtain labels (SKU starts with 6004-) from the rest, same
+    # as the Easy Ship tab. Curtains print as their own downloadable PDF. ---
+    curtain_entries = [e for e in included_entries if
+                       any(it['sku'].upper().startswith('6004-')
+                           for it in e.get('items', []) if it.get('sku'))]
+    main_entries = [e for e in included_entries if e not in curtain_entries]
+
+    # Pick list is built from ALL included entries (curtains + main) so the
+    # overall totals stay complete even though curtains print separately.
     pick_list = build_pick_list(included_entries)
 
     writer = PdfWriter()
+    curtain_writer = PdfWriter() if curtain_entries else None
 
     # Peek the first included label's dimensions for the pick-list page
     label_w, label_h = 283, 425
@@ -2290,22 +2449,31 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
 
     results = []
 
-    # 3. Stamp only the label pages (no packing slips in output), in SKU order
+    # 3. Stamp only the label pages (no packing slips in output), in SKU order.
+    #    Every label gets its page number (position in this batch) and the
+    #    batch id stamped on it; curtain labels route to the curtain PDF.
+    total_count = len(included_entries)
     for i, ent in enumerate(included_entries):
-        update(40 + int((i / max(len(included_entries), 1)) * 55),
-               'Stamping ' + str(i + 1) + '/' + str(len(included_entries)))
+        update(40 + int((i / max(total_count, 1)) * 55),
+               'Stamping ' + str(i + 1) + '/' + str(total_count))
         fname = Path(ent['path']).name
+        is_curtain = ent in curtain_entries
         try:
             reader = PdfReader(str(ent['path']))
             page = reader.pages[ent['index']]  # the label page (even index)
             pw = float(page.mediabox.width)
             ph = float(page.mediabox.height)
 
-            if ent['items']:
-                overlay_rows = [(it['sku'], it['qty']) for it in ent['items']]
-                ov = create_evri_direct_overlay(overlay_rows, pw, ph)
-                page.merge_page(PdfReader(ov).pages[0])
-            writer.add_page(page)
+            overlay_rows = [(it['sku'], it['qty']) for it in ent['items']] if ent['items'] else []
+            ov = create_evri_direct_overlay(overlay_rows, pw, ph,
+                                            page_num=i + 1, total_pages=total_count,
+                                            batch_id=run_label)
+            page.merge_page(PdfReader(ov).pages[0])
+
+            if is_curtain:
+                curtain_writer.add_page(page)
+            else:
+                writer.add_page(page)
 
             has_sku = any(it['sku'] and it['sku'] != '(no SKU)' for it in ent['items'])
             results.append({
@@ -2315,7 +2483,8 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
                 'carrier': 'Evri · Direct',
                 'needs_check': not has_sku,
                 'postcode': ent['postcode']['postcode'],
-                'warn_reason': None if has_sku else 'no SKU found on packing slip'
+                'warn_reason': None if has_sku else 'no SKU found on packing slip',
+                'is_curtain': is_curtain
             })
         except Exception as e:
             results.append({'file': fname, 'status': 'error', 'error': str(e),
@@ -2356,6 +2525,19 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
     with open(out_path, 'rb') as f:
         save_label_file(job_id, 'evri_direct', run_label, download_name, f.read())
     save_pick_list_entries(job_id, 'evri_direct', run_label, pick_list)
+
+    # Save curtain labels as a separate downloadable PDF if any exist
+    curtains_job_id = None
+    curtain_count = len(curtain_entries)
+    if curtain_writer and curtain_count > 0:
+        curtains_job_id = job_id + '_curtains'
+        curtain_path = os.path.join(tmpdir, 'curtains_evri_direct_' + job_id + '.pdf')
+        with open(curtain_path, 'wb') as f:
+            curtain_writer.write(f)
+        curtain_download_name = 'curtains_evri_direct_' + ts + '.pdf'
+        with open(curtain_path, 'rb') as f:
+            save_label_file(curtains_job_id, 'evri_direct', run_label,
+                            curtain_download_name, f.read())
 
     # ── Tracking upload generation ──────────────────────────────────────────
     update(96, 'Generating tracking uploads...')
@@ -2430,6 +2612,8 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
         jobs[job_id]['status'] = 'done'
         jobs[job_id]['progress'] = 100
         msg = str(ok_count) + '/' + str(total_labels) + ' Evri Direct labels processed'
+        if curtain_count:
+            msg += ' — 🪟 ' + str(curtain_count) + ' curtain label' + ('s' if curtain_count != 1 else '') + ' separated'
         if warn_count:
             msg += ' — ⚠ ' + str(warn_count) + ' had no SKU'
         if out_of_area_count:
@@ -2454,6 +2638,9 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
         jobs[job_id]['pick_list'] = pick_list
         jobs[job_id]['tracking_summary'] = tracking_summary
         jobs[job_id]['tracking_files'] = tracking_files_info
+        if curtains_job_id:
+            jobs[job_id]['curtains_job_id'] = curtains_job_id
+            jobs[job_id]['curtain_count'] = curtain_count
 
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
@@ -2462,10 +2649,30 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
 def index():
     return render_template('index.html')
 
+def run_with_dedup(target, job_id, fresh_files, tmpdir, tab, dup_summary):
+    """Run a processor on the fresh (non-duplicate) files, then fingerprint
+    those files so a later re-upload is recognised, and prepend any
+    duplicate-skipped warning to the finished job message."""
+    try:
+        target(job_id, fresh_files, tmpdir)
+    finally:
+        with jobs_lock:
+            batch_id = jobs.get(job_id, {}).get('batch_id', '')
+        save_processed_files(fresh_files, tab, job_id, batch_id)
+        if dup_summary and dup_summary.get('count'):
+            with jobs_lock:
+                job = jobs.get(job_id)
+                if job is not None:
+                    base_msg = job.get('message', '')
+                    job['message'] = dup_summary['text'] + ' — ' + base_msg
+                    job['dup_summary'] = dup_summary
+
+
 @app.route('/upload', methods=['POST'])
 def upload():
     cleanup_old_label_files()
     cleanup_old_pick_list_entries()
+    cleanup_old_processed_files()
     job_id = str(uuid.uuid4())[:8]
     tmpdir = tempfile.mkdtemp()
     pdf_files = []
@@ -2491,12 +2698,34 @@ def upload():
     if not pdf_files:
         return jsonify({'error': 'No PDF files found in upload'}), 400
 
+    # Tab key matches the one used for label_files / pick_list_entries.
+    tab = {'thirdparty': 'thirdparty', 'easyship': 'easyship',
+           'evri_direct': 'evri_direct'}.get(mode, 'amazon')
+
+    # Skip files already processed on this tab; keep genuinely new ones.
+    fresh_files, dups = check_duplicate_files(pdf_files, tab)
+    dup_summary = build_dup_summary(dups)
+
     with jobs_lock:
         jobs[job_id] = {
             'status': 'processing', 'progress': 0,
             'message': 'Starting — ' + str(len(pdf_files)) + ' PDF(s) found...',
             'result_path': None, 'results': [], 'batch_id': '', 'download_name': 'merged_labels.pdf'
         }
+        if dup_summary:
+            jobs[job_id]['dup_summary'] = dup_summary
+
+    # Every file was a duplicate — nothing new to do.
+    if not fresh_files:
+        with jobs_lock:
+            jobs[job_id]['status'] = 'done'
+            jobs[job_id]['progress'] = 100
+            jobs[job_id]['message'] = (dup_summary['text'] + ' — nothing new to process'
+                                       if dup_summary else 'Nothing to process')
+            jobs[job_id]['results'] = []
+        return jsonify({'job_id': job_id, 'total': len(pdf_files),
+                        'duplicates': len(dups), 'fresh': 0})
+
     if mode == 'thirdparty':
         target = process_thirdparty
     elif mode == 'easyship':
@@ -2505,10 +2734,12 @@ def upload():
         target = process_evri_direct
     else:
         target = run_job
-    t = threading.Thread(target=target, args=(job_id, pdf_files, tmpdir))
+    t = threading.Thread(target=run_with_dedup,
+                         args=(target, job_id, fresh_files, tmpdir, tab, dup_summary))
     t.daemon = True
     t.start()
-    return jsonify({'job_id': job_id, 'total': len(pdf_files)})
+    return jsonify({'job_id': job_id, 'total': len(pdf_files),
+                    'duplicates': len(dups), 'fresh': len(fresh_files)})
 
 @app.route('/status/<job_id>')
 def status(job_id):
