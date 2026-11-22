@@ -3463,23 +3463,33 @@ def _period_bounds(period, ref_date_str=None, from_str=None, to_str=None):
     else:
         step = 7  # 'week' is the default
 
+    # Rolling window based on actual dates — NOT snapped to a Monday, so the
+    # total never resets on a calendar-week boundary. The default ("current")
+    # window is today plus the previous step-1 days (e.g. the last 7 days
+    # ending today). Navigating with ?ref= sets the window's start date and
+    # steps backward/forward in whole `step`-day blocks from there.
     if ref_date_str:
         try:
             ref = datetime.strptime(ref_date_str, '%Y-%m-%d').replace(tzinfo=tz)
         except Exception:
-            ref = now
+            ref = None
     else:
-        ref = now
-    # Snap to Monday
-    monday = ref - timedelta(days=ref.weekday())
-    monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
-    start = monday
-    end = monday + timedelta(days=step)
+        ref = None
+
+    if ref is not None:
+        # Explicit navigation: ref is the window's start date.
+        start = ref.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=step)
+    else:
+        # Current window: rolling, ending today.
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = today + timedelta(days=1)       # include all of today
+        start = end - timedelta(days=step)    # last `step` days
     end_display = end - timedelta(days=1)
     if step == 7:
-        label = f"Week of {start.strftime('%d %b %Y')} – {end_display.strftime('%d %b %Y')}"
+        label = f"Last 7 days: {start.strftime('%d %b %Y')} – {end_display.strftime('%d %b %Y')}"
     else:
-        label = f"Fortnight: {start.strftime('%d %b %Y')} – {end_display.strftime('%d %b %Y')}"
+        label = f"Last 14 days: {start.strftime('%d %b %Y')} – {end_display.strftime('%d %b %Y')}"
     prev_p = {'period': period, 'ref': (start - timedelta(days=step)).strftime('%Y-%m-%d')}
     next_p = {'period': period, 'ref': end.strftime('%Y-%m-%d')}
     return start, end, label, prev_p, next_p
@@ -3509,8 +3519,10 @@ def _pick_list_totals_query(monday, next_monday, tab_filter):
 @admin_required
 def pick_list_totals():
     """Totals across every pick list ever generated, with selectable period:
-    Week (Mon\u2013Sun), Fortnight (2 weeks), Month (calendar month), or Custom
-    date range. Data comes from pick_list_entries (3-month rolling retention)."""
+    Week (rolling last 7 days ending today), Fortnight (rolling last 14 days),
+    Month (calendar month), or Custom date range. The week/fortnight windows
+    are date-based and do NOT reset on a Monday. Data comes from
+    pick_list_entries (3-month rolling retention)."""
     period = request.args.get('period', 'week')
     if period not in ('week', 'fortnight', 'month', 'custom'):
         period = 'week'
