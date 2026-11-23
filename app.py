@@ -1128,6 +1128,7 @@ def run_job(job_id, pdf_files, tmpdir):
         page_num = i + 1
         update(45 + int((i / total) * 50),
                'Stamping ' + str(page_num) + '/' + str(total_pages) + ' [' + batch_id + ']: ' + entry['file'])
+        page_added = False
         try:
             reader = PdfReader(str(entry['path']))
             label_page = reader.pages[0]
@@ -1135,6 +1136,10 @@ def run_job(job_id, pdf_files, tmpdir):
             ph = float(label_page.mediabox.height)
             warn = entry.get('needs_check', False)
 
+            # pypdf 7 removed merging onto a page that isn't owned by a writer,
+            # so attach the page to the writer FIRST and stamp the attached copy.
+            added = writer.add_page(label_page)
+            page_added = True
             # Stamp is best-effort: a stamp failure must not drop the label.
             stamp_err = None
             try:
@@ -1146,11 +1151,10 @@ def run_job(job_id, pdf_files, tmpdir):
                     overlay_buf = create_evri_overlay(
                         entry['items'], entry['order_id'],
                         page_num, total_pages, batch_id, pw, ph, warn=warn)
-                label_page.merge_page(PdfReader(overlay_buf).pages[0])
+                added.merge_page(PdfReader(overlay_buf).pages[0])
             except Exception as se:
                 stamp_err = str(se)
                 print(f"Amazon stamp failed p{page_num} ({entry['file']}): {se}")
-            writer.add_page(label_page)
 
             warn_reason = []
             if not entry['qty_confident']:
@@ -1167,11 +1171,12 @@ def run_job(job_id, pdf_files, tmpdir):
                 'warn_reason': ' | '.join(warn_reason) if warn_reason else None
             })
         except Exception as e:
-            try:
-                raw = PdfReader(str(entry['path'])).pages[0]
-                writer.add_page(raw)
-            except Exception:
-                pass
+            if not page_added:
+                try:
+                    raw = PdfReader(str(entry['path'])).pages[0]
+                    writer.add_page(raw)
+                except Exception:
+                    pass
             results.append({'file': entry['file'], 'status': 'error', 'error': str(e),
                            'needs_check': True, 'warn_reason': 'included un-stamped'})
 
@@ -1562,12 +1567,17 @@ def process_easyship(job_id, pdf_files, tmpdir):
         fname = Path(ent['path']).name
         is_curtain = ent in curtain_entries
         target_writer = curtain_writer if (is_curtain and curtain_writer) else writer
+        page_added = False
         try:
             reader = PdfReader(str(ent['path']))
             page = reader.pages[ent['index']]
             pw = float(page.mediabox.width)
             ph = float(page.mediabox.height)
             overlay_rows = [(it['sku'], it['qty']) for it in ent['items']] if ent['items'] else []
+            # pypdf 7 removed merging onto a page that isn't owned by a writer,
+            # so attach the page to its writer FIRST and stamp the attached copy.
+            added = target_writer.add_page(page)
+            page_added = True
             # Stamp is best-effort: if it fails, the un-stamped label still
             # goes out rather than the whole batch being lost.
             stamp_err = None
@@ -1575,13 +1585,10 @@ def process_easyship(job_id, pdf_files, tmpdir):
                 ov = create_easyship_overlay(overlay_rows, pw, ph,
                                              page_num=i + 1, total_pages=len(included_entries),
                                              batch_id=run_label)
-                page.merge_page(PdfReader(ov).pages[0])
+                added.merge_page(PdfReader(ov).pages[0])
             except Exception as se:
                 stamp_err = str(se)
                 print(f"ES stamp failed p{i+1} ({fname}): {se}")
-
-            # Route the (stamped or raw) page to the correct writer
-            target_writer.add_page(page)
 
             has_sku = bool(ent['items'])
             warn = None if has_sku else 'could not read SKU/Qty line'
@@ -1598,11 +1605,12 @@ def process_easyship(job_id, pdf_files, tmpdir):
             })
         except Exception as e:
             # Last resort: still include the raw label page so it's never lost.
-            try:
-                raw = PdfReader(str(ent['path'])).pages[ent['index']]
-                target_writer.add_page(raw)
-            except Exception:
-                pass
+            if not page_added:
+                try:
+                    raw = PdfReader(str(ent['path'])).pages[ent['index']]
+                    target_writer.add_page(raw)
+                except Exception:
+                    pass
             results.append({'file': fname, 'status': 'error', 'error': str(e),
                             'needs_check': True, 'warn_reason': 'included un-stamped'})
 
@@ -1754,6 +1762,7 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
         update(40 + int((i / max(len(included_entries), 1)) * 55),
                'Formatting ' + str(i + 1) + '/' + str(len(included_entries)))
         fname = Path(ent['path']).name
+        page_added = False
         try:
             reader = PdfReader(str(ent['path']))
             page = reader.pages[ent['index']]
@@ -1765,7 +1774,10 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
                 shift = 0.0
                 target_h = ph
 
-            new_page = PageObject.create_blank_page(width=pw, height=target_h)
+            # pypdf 7 removed merging onto a page that isn't owned by a writer,
+            # so add the blank page to the writer FIRST, then compose onto it.
+            new_page = writer.add_page(PageObject.create_blank_page(width=pw, height=target_h))
+            page_added = True
             new_page.merge_transformed_page(page, Transformation().translate(0, -shift))
             overlay_rows = [(it['sku'], it['qty']) for it in ent['items']] if ent['items'] else []
             # Stamp is best-effort: a stamp failure must not drop the label.
@@ -1778,7 +1790,6 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
             except Exception as se:
                 stamp_err = str(se)
                 print(f"TP stamp failed p{i+1} ({fname}): {se}")
-            writer.add_page(new_page)
 
             has_sku = bool(ent['items'])
             warn = None if has_sku else 'no SKU found on label'
@@ -1794,11 +1805,12 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
                 'warn_reason': warn
             })
         except Exception as e:
-            try:
-                raw = PdfReader(str(ent['path'])).pages[ent['index']]
-                writer.add_page(raw)
-            except Exception:
-                pass
+            if not page_added:
+                try:
+                    raw = PdfReader(str(ent['path'])).pages[ent['index']]
+                    writer.add_page(raw)
+                except Exception:
+                    pass
             results.append({'file': fname, 'status': 'error', 'error': str(e),
                             'needs_check': True, 'warn_reason': 'included un-stamped'})
 
@@ -2471,6 +2483,7 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
         fname = Path(ent['path']).name
         is_curtain = ent in curtain_entries
         target_writer = curtain_writer if (is_curtain and curtain_writer) else writer
+        page_added = False
         try:
             reader = PdfReader(str(ent['path']))
             page = reader.pages[ent['index']]  # the label page (even index)
@@ -2478,18 +2491,20 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
             ph = float(page.mediabox.height)
 
             overlay_rows = [(it['sku'], it['qty']) for it in ent['items']] if ent['items'] else []
+            # pypdf 7 removed merging onto a page that isn't owned by a writer,
+            # so attach the page to its writer FIRST and stamp the attached copy.
+            added = target_writer.add_page(page)
+            page_added = True
             # Stamp is best-effort: a stamp failure must not drop the label.
             stamp_err = None
             try:
                 ov = create_evri_direct_overlay(overlay_rows, pw, ph,
                                                 page_num=i + 1, total_pages=total_count,
                                                 batch_id=run_label)
-                page.merge_page(PdfReader(ov).pages[0])
+                added.merge_page(PdfReader(ov).pages[0])
             except Exception as se:
                 stamp_err = str(se)
                 print(f"ED stamp failed p{i+1} ({fname}): {se}")
-
-            target_writer.add_page(page)
 
             has_sku = any(it['sku'] and it['sku'] != '(no SKU)' for it in ent['items'])
             warn = None if has_sku else 'no SKU found on packing slip'
@@ -2506,11 +2521,12 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
                 'is_curtain': is_curtain
             })
         except Exception as e:
-            try:
-                raw = PdfReader(str(ent['path'])).pages[ent['index']]
-                target_writer.add_page(raw)
-            except Exception:
-                pass
+            if not page_added:
+                try:
+                    raw = PdfReader(str(ent['path'])).pages[ent['index']]
+                    target_writer.add_page(raw)
+                except Exception:
+                    pass
             results.append({'file': fname, 'status': 'error', 'error': str(e),
                             'needs_check': True, 'warn_reason': 'included un-stamped'})
 
