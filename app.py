@@ -21,6 +21,10 @@ app.secret_key = os.environ.get('ADMIN_PASSWORD', 'changeme') + '_secret'
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 jobs = {}
 jobs_lock = threading.Lock()
+# job_id -> fingerprint of the exact set of files in that upload. Used so a
+# re-upload of the same file(s) replaces its pick-list totals instead of adding
+# them again. Cleared when the job finishes.
+batch_fingerprints = {}
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'M4Mart2026')
 DATABASE_URL = os.environ.get('DATABASE_URL')
 WEBSITE_URL = 'pillowfactory.co.uk'
@@ -98,6 +102,10 @@ def init_db():
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             )
         ''')
+        # batch_fp = fingerprint of the exact upload (set of file hashes) these
+        # rows came from. Lets a re-upload of the same file(s) replace its rows
+        # instead of adding duplicates — see save_pick_list_entries().
+        cur.execute("ALTER TABLE pick_list_entries ADD COLUMN IF NOT EXISTS batch_fp TEXT")
         # Tracking uploads: remember which order IDs have already had their
         # tracking written to a Tesco / B&Q file, so we never re-upload them.
         cur.execute('''
@@ -242,12 +250,13 @@ def cleanup_old_processed_files():
         print(f"Processed-files cleanup error: {e}")
 
 
-# ── DUPLICATE FILE DETECTION ─────────────────────────────────────────────────
-# Re-uploading the exact same PDF (common while testing) used to re-count every
-# SKU into the weekly pick-list totals. We now fingerprint each uploaded file
-# (SHA-256 of its bytes) per tab: a file already seen on the same tab is a
-# duplicate — skipped from this batch and from the pick-list totals — while any
-# genuinely new files in the same upload are still processed normally.
+# ── DUPLICATE UPLOAD HANDLING ────────────────────────────────────────────────
+# Re-uploading the exact same PDF(s) — common while testing, retrying after an
+# error, or reprinting — used to re-count every SKU into the weekly pick-list
+# totals. We now fingerprint the whole upload (the sorted set of file hashes).
+# Labels are ALWAYS produced (a re-upload is never blocked), but the pick-list
+# contribution of an identical re-upload REPLACES the previous one instead of
+# adding to it (see save_pick_list_entries), so the weekly totals don't inflate.
 
 def file_sha256(path):
     """Content hash of a file's bytes, streamed so large PDFs don't load whole."""
@@ -258,85 +267,34 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def check_duplicate_files(pdf_files, tab):
-    """Split uploaded files into (fresh, dups) for this tab.
-
-    fresh : paths to actually process (never seen before on this tab)
-    dups  : list of {filename, batch_id, created_at, label_count} already processed
-
-    Fail-open: on any DB error, treat everything as fresh so a real run is
-    never blocked by the dedup check."""
-    fresh, dups = [], []
+def compute_batch_fingerprint(pdf_files):
+    """Fingerprint of an entire upload: hash of its files' sorted content
+    hashes. Same files (any order) → same fingerprint. None on any error."""
     try:
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        for p in pdf_files:
-            try:
-                fh = file_sha256(p)
-            except Exception:
-                fresh.append(p)
-                continue
-            cur.execute('SELECT batch_id, created_at, label_count FROM processed_files '
-                        'WHERE file_hash = %s AND tab = %s', (fh, tab))
-            prior = cur.fetchone()
-            if prior:
-                dups.append({'filename': Path(p).name, 'batch_id': prior['batch_id'],
-                             'created_at': prior['created_at'],
-                             'label_count': prior['label_count'] or 0})
-            else:
-                fresh.append(p)
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"Duplicate check error: {e}")
-        return list(pdf_files), []
-    return fresh, dups
+        hs = sorted(file_sha256(p) for p in pdf_files)
+    except Exception:
+        return None
+    if not hs:
+        return None
+    return hashlib.sha256('|'.join(hs).encode()).hexdigest()
 
 
-def save_processed_files(pdf_files, tab, job_id, batch_id):
-    """Record the fingerprint of each file just processed, so a later
-    re-upload of the same bytes on the same tab is recognised as a duplicate.
-    label_count is the PDF's page count (a rough 'how big was it' hint for the
-    warning), best-effort only."""
-    if not pdf_files:
-        return
+def batch_fingerprint_seen(batch_fp, tab):
+    """True if this exact upload was already turned into pick-list rows on this
+    tab before (so the user can be told it's a repeat). Fail-safe: False."""
+    if not batch_fp:
+        return False
     try:
         conn = get_db()
         cur = conn.cursor()
-        for p in pdf_files:
-            try:
-                fh = file_sha256(p)
-            except Exception:
-                continue
-            try:
-                page_count = len(PdfReader(str(p)).pages)
-            except Exception:
-                page_count = 0
-            cur.execute('''
-                INSERT INTO processed_files (file_hash, tab, job_id, batch_id, label_count, filename)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (file_hash, tab) DO UPDATE SET
-                    job_id = EXCLUDED.job_id, batch_id = EXCLUDED.batch_id,
-                    label_count = EXCLUDED.label_count, created_at = NOW()
-            ''', (fh, tab, job_id, batch_id, page_count, Path(p).name))
-        conn.commit()
+        cur.execute('SELECT 1 FROM pick_list_entries WHERE batch_fp = %s AND tab = %s LIMIT 1',
+                    (batch_fp, tab))
+        found = cur.fetchone() is not None
         cur.close()
         conn.close()
-    except Exception as e:
-        print(f"Save processed files error: {e}")
-
-
-def build_dup_summary(dups):
-    """Turn the duplicate list into a short warning string for the job message."""
-    if not dups:
-        return None
-    n = len(dups)
-    batches = sorted({d['batch_id'] for d in dups if d.get('batch_id')})
-    text = '♻ ' + str(n) + ' file' + ('s' if n != 1 else '') + ' already processed'
-    if batches:
-        text += ' (batch ' + ', '.join(batches) + ')'
-    text += ' — skipped'
-    return {'count': n, 'text': text, 'files': dups}
+        return found
+    except Exception:
+        return False
 
 
 def save_label_file(job_id, tab, batch_id, filename, file_bytes):
@@ -365,17 +323,26 @@ def save_pick_list_entries(job_id, tab, batch_id, pick_list):
     """Record every SKU/qty line from a generated pick list. Kept for 3
     months (its own cleanup, separate from the 2-day label-file window —
     see cleanup_old_pick_list_entries()) — this is the running history
-    that /admin/pick-list-totals sums for weekly totals."""
+    that /admin/pick-list-totals sums for weekly totals.
+
+    Deduplication: if this exact upload (same set of files) was recorded
+    before, its previous rows are deleted first so re-running the same file
+    replaces its totals instead of adding them again. The fingerprint is
+    looked up by job_id from batch_fingerprints, set in upload()."""
     if not pick_list:
         return
+    batch_fp = batch_fingerprints.get(job_id)
     try:
         conn = get_db()
         cur = conn.cursor()
+        if batch_fp:
+            cur.execute('DELETE FROM pick_list_entries WHERE batch_fp = %s AND tab = %s',
+                        (batch_fp, tab))
         for entry in pick_list:
             cur.execute('''
-                INSERT INTO pick_list_entries (job_id, tab, batch_id, sku, qty)
-                VALUES (%s, %s, %s, %s, %s)
-            ''', (job_id, tab, batch_id, entry['sku'], entry['qty']))
+                INSERT INTO pick_list_entries (job_id, tab, batch_id, sku, qty, batch_fp)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            ''', (job_id, tab, batch_id, entry['sku'], entry['qty'], batch_fp))
         conn.commit()
         cur.close()
         conn.close()
@@ -1168,34 +1135,45 @@ def run_job(job_id, pdf_files, tmpdir):
             ph = float(label_page.mediabox.height)
             warn = entry.get('needs_check', False)
 
-            if entry['rm_label']:
-                overlay_buf = create_royal_mail_overlay(
-                    entry['items'], entry['order_id'],
-                    page_num, total_pages, batch_id, pw, ph, warn=warn)
-            else:
-                overlay_buf = create_evri_overlay(
-                    entry['items'], entry['order_id'],
-                    page_num, total_pages, batch_id, pw, ph, warn=warn)
-
-            overlay_reader = PdfReader(overlay_buf)
-            label_page.merge_page(overlay_reader.pages[0])
+            # Stamp is best-effort: a stamp failure must not drop the label.
+            stamp_err = None
+            try:
+                if entry['rm_label']:
+                    overlay_buf = create_royal_mail_overlay(
+                        entry['items'], entry['order_id'],
+                        page_num, total_pages, batch_id, pw, ph, warn=warn)
+                else:
+                    overlay_buf = create_evri_overlay(
+                        entry['items'], entry['order_id'],
+                        page_num, total_pages, batch_id, pw, ph, warn=warn)
+                label_page.merge_page(PdfReader(overlay_buf).pages[0])
+            except Exception as se:
+                stamp_err = str(se)
+                print(f"Amazon stamp failed p{page_num} ({entry['file']}): {se}")
             writer.add_page(label_page)
 
             warn_reason = []
             if not entry['qty_confident']:
                 warn_reason.append('qty unconfirmed')
+            if stamp_err:
+                warn_reason.append('stamp skipped (' + stamp_err + ')')
 
             results.append({
                 'file': entry['file'], 'status': 'ok',
                 'items': entry['items'], 'order_id': entry['order_id'],
                 'page': page_num, 'batch': batch_id,
                 'carrier': 'Royal Mail' if entry['rm_label'] else 'Evri',
-                'needs_check': warn,
+                'needs_check': warn or bool(stamp_err),
                 'warn_reason': ' | '.join(warn_reason) if warn_reason else None
             })
         except Exception as e:
+            try:
+                raw = PdfReader(str(entry['path'])).pages[0]
+                writer.add_page(raw)
+            except Exception:
+                pass
             results.append({'file': entry['file'], 'status': 'error', 'error': str(e),
-                           'needs_check': False, 'warn_reason': None})
+                           'needs_check': True, 'warn_reason': 'included un-stamped'})
 
     update(95, 'Saving PDF...')
     out_path = os.path.join(tmpdir, 'labels_batch' + batch_id + '_' + job_id + '.pdf')
@@ -1583,36 +1561,50 @@ def process_easyship(job_id, pdf_files, tmpdir):
                'Stamping ' + str(i + 1) + '/' + str(len(included_entries)))
         fname = Path(ent['path']).name
         is_curtain = ent in curtain_entries
+        target_writer = curtain_writer if (is_curtain and curtain_writer) else writer
         try:
             reader = PdfReader(str(ent['path']))
             page = reader.pages[ent['index']]
             pw = float(page.mediabox.width)
             ph = float(page.mediabox.height)
             overlay_rows = [(it['sku'], it['qty']) for it in ent['items']] if ent['items'] else []
-            ov = create_easyship_overlay(overlay_rows, pw, ph,
-                                         page_num=i + 1, total_pages=len(included_entries),
-                                         batch_id=run_label)
-            page.merge_page(PdfReader(ov).pages[0])
+            # Stamp is best-effort: if it fails, the un-stamped label still
+            # goes out rather than the whole batch being lost.
+            stamp_err = None
+            try:
+                ov = create_easyship_overlay(overlay_rows, pw, ph,
+                                             page_num=i + 1, total_pages=len(included_entries),
+                                             batch_id=run_label)
+                page.merge_page(PdfReader(ov).pages[0])
+            except Exception as se:
+                stamp_err = str(se)
+                print(f"ES stamp failed p{i+1} ({fname}): {se}")
 
-            # Route the stamped page to the correct writer
-            if is_curtain:
-                curtain_writer.add_page(page)
-            else:
-                writer.add_page(page)
+            # Route the (stamped or raw) page to the correct writer
+            target_writer.add_page(page)
 
             has_sku = bool(ent['items'])
+            warn = None if has_sku else 'could not read SKU/Qty line'
+            if stamp_err:
+                warn = (warn + '; ' if warn else '') + 'stamp skipped (' + stamp_err + ')'
             results.append({
                 'file': fname, 'status': 'ok',
                 'items': ent['items'] or [{'sku': '(no SKU read)', 'qty': '?'}],
                 'order_id': '', 'page': i + 1, 'batch': run_label,
                 'carrier': 'Evri · Easy Ship',
-                'needs_check': not has_sku,
-                'warn_reason': None if has_sku else 'could not read SKU/Qty line',
+                'needs_check': (not has_sku) or bool(stamp_err),
+                'warn_reason': warn,
                 'is_curtain': is_curtain
             })
         except Exception as e:
+            # Last resort: still include the raw label page so it's never lost.
+            try:
+                raw = PdfReader(str(ent['path'])).pages[ent['index']]
+                target_writer.add_page(raw)
+            except Exception:
+                pass
             results.append({'file': fname, 'status': 'error', 'error': str(e),
-                            'needs_check': False, 'warn_reason': None})
+                            'needs_check': True, 'warn_reason': 'included un-stamped'})
 
     for ent in error_entries:
         fname = Path(ent['path']).name
@@ -1626,6 +1618,8 @@ def process_easyship(job_id, pdf_files, tmpdir):
 
     ok_count = len([r for r in results if r['status'] == 'ok'])
     warn_count = len([r for r in results if r.get('needs_check')])
+    error_count = len([r for r in results if r['status'] == 'error'])
+    first_error = next((r['error'] for r in results if r['status'] == 'error'), None)
     ts = datetime.now(ZoneInfo('Europe/London')).strftime('%Y-%m-%d_%H%M')
     download_name = 'labels_easyship_' + ts + '.pdf'
 
@@ -1654,6 +1648,10 @@ def process_easyship(job_id, pdf_files, tmpdir):
             msg += ' — 🪟 ' + str(curtain_count) + ' curtain label' + ('s' if curtain_count != 1 else '') + ' separated'
         if warn_count:
             msg += ' — ⚠ ' + str(warn_count) + ' need checking'
+        if error_count:
+            msg += ' — ❌ ' + str(error_count) + ' errored'
+            if first_error:
+                msg += ' (' + first_error[:120] + ')'
         jobs[job_id]['message'] = msg
         jobs[job_id]['result_path'] = out_path
         jobs[job_id]['results'] = results
@@ -1770,25 +1768,39 @@ def process_thirdparty(job_id, pdf_files, tmpdir):
             new_page = PageObject.create_blank_page(width=pw, height=target_h)
             new_page.merge_transformed_page(page, Transformation().translate(0, -shift))
             overlay_rows = [(it['sku'], it['qty']) for it in ent['items']] if ent['items'] else []
-            ov = create_thirdparty_overlay(overlay_rows, pw, target_h,
-                                           page_num=i + 1, total_pages=len(included_entries),
-                                           batch_id=run_label)
-            new_page.merge_page(PdfReader(ov).pages[0])
+            # Stamp is best-effort: a stamp failure must not drop the label.
+            stamp_err = None
+            try:
+                ov = create_thirdparty_overlay(overlay_rows, pw, target_h,
+                                               page_num=i + 1, total_pages=len(included_entries),
+                                               batch_id=run_label)
+                new_page.merge_page(PdfReader(ov).pages[0])
+            except Exception as se:
+                stamp_err = str(se)
+                print(f"TP stamp failed p{i+1} ({fname}): {se}")
             writer.add_page(new_page)
 
             has_sku = bool(ent['items'])
+            warn = None if has_sku else 'no SKU found on label'
+            if stamp_err:
+                warn = (warn + '; ' if warn else '') + 'stamp skipped (' + stamp_err + ')'
             results.append({
                 'file': fname, 'status': 'ok',
                 'items': ent['items'] or [{'sku': '(no SKU on label)', 'qty': '?'}],
                 'order_id': '', 'page': i + 1, 'batch': run_label,
                 'carrier': 'Evri · 3rd-party',
-                'needs_check': not has_sku,
+                'needs_check': (not has_sku) or bool(stamp_err),
                 'postcode': ent['postcode']['postcode'],
-                'warn_reason': None if has_sku else 'no SKU found on label'
+                'warn_reason': warn
             })
         except Exception as e:
+            try:
+                raw = PdfReader(str(ent['path'])).pages[ent['index']]
+                writer.add_page(raw)
+            except Exception:
+                pass
             results.append({'file': fname, 'status': 'error', 'error': str(e),
-                            'needs_check': False, 'warn_reason': None})
+                            'needs_check': True, 'warn_reason': 'included un-stamped'})
 
     # 4. flagged/unreadable-postcode labels never enter the merge — surfaced
     #    here instead so they can be found and cancelled on Amazon.
@@ -2458,6 +2470,7 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
                'Stamping ' + str(i + 1) + '/' + str(total_count))
         fname = Path(ent['path']).name
         is_curtain = ent in curtain_entries
+        target_writer = curtain_writer if (is_curtain and curtain_writer) else writer
         try:
             reader = PdfReader(str(ent['path']))
             page = reader.pages[ent['index']]  # the label page (even index)
@@ -2465,30 +2478,41 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
             ph = float(page.mediabox.height)
 
             overlay_rows = [(it['sku'], it['qty']) for it in ent['items']] if ent['items'] else []
-            ov = create_evri_direct_overlay(overlay_rows, pw, ph,
-                                            page_num=i + 1, total_pages=total_count,
-                                            batch_id=run_label)
-            page.merge_page(PdfReader(ov).pages[0])
+            # Stamp is best-effort: a stamp failure must not drop the label.
+            stamp_err = None
+            try:
+                ov = create_evri_direct_overlay(overlay_rows, pw, ph,
+                                                page_num=i + 1, total_pages=total_count,
+                                                batch_id=run_label)
+                page.merge_page(PdfReader(ov).pages[0])
+            except Exception as se:
+                stamp_err = str(se)
+                print(f"ED stamp failed p{i+1} ({fname}): {se}")
 
-            if is_curtain:
-                curtain_writer.add_page(page)
-            else:
-                writer.add_page(page)
+            target_writer.add_page(page)
 
             has_sku = any(it['sku'] and it['sku'] != '(no SKU)' for it in ent['items'])
+            warn = None if has_sku else 'no SKU found on packing slip'
+            if stamp_err:
+                warn = (warn + '; ' if warn else '') + 'stamp skipped (' + stamp_err + ')'
             results.append({
                 'file': fname, 'status': 'ok',
                 'items': ent['items'] or [{'sku': '(no SKU)', 'qty': '?'}],
                 'order_id': '', 'page': i + 1, 'batch': run_label,
                 'carrier': 'Evri · Direct',
-                'needs_check': not has_sku,
+                'needs_check': (not has_sku) or bool(stamp_err),
                 'postcode': ent['postcode']['postcode'],
-                'warn_reason': None if has_sku else 'no SKU found on packing slip',
+                'warn_reason': warn,
                 'is_curtain': is_curtain
             })
         except Exception as e:
+            try:
+                raw = PdfReader(str(ent['path'])).pages[ent['index']]
+                target_writer.add_page(raw)
+            except Exception:
+                pass
             results.append({'file': fname, 'status': 'error', 'error': str(e),
-                            'needs_check': False, 'warn_reason': None})
+                            'needs_check': True, 'warn_reason': 'included un-stamped'})
 
     # 4. Excluded / error entries — surfaced so user can cancel on Evri
     for ent in excluded_entries:
@@ -2649,23 +2673,21 @@ def process_evri_direct(job_id, pdf_files, tmpdir):
 def index():
     return render_template('index.html')
 
-def run_with_dedup(target, job_id, fresh_files, tmpdir, tab, dup_summary):
-    """Run a processor on the fresh (non-duplicate) files, then fingerprint
-    those files so a later re-upload is recognised, and prepend any
-    duplicate-skipped warning to the finished job message."""
+def run_with_dedup(target, job_id, pdf_files, tmpdir, repeat_note):
+    """Run a processor on ALL uploaded files — duplicates are never skipped, so
+    a re-upload (retry after an error, or a reprint) always produces its labels.
+    Totals don't inflate because save_pick_list_entries replaces this upload's
+    previous pick-list rows via the batch fingerprint. Any 'same file again'
+    note is prepended to the finished message."""
     try:
-        target(job_id, fresh_files, tmpdir)
+        target(job_id, pdf_files, tmpdir)
     finally:
-        with jobs_lock:
-            batch_id = jobs.get(job_id, {}).get('batch_id', '')
-        save_processed_files(fresh_files, tab, job_id, batch_id)
-        if dup_summary and dup_summary.get('count'):
+        if repeat_note:
             with jobs_lock:
                 job = jobs.get(job_id)
                 if job is not None:
-                    base_msg = job.get('message', '')
-                    job['message'] = dup_summary['text'] + ' — ' + base_msg
-                    job['dup_summary'] = dup_summary
+                    job['message'] = repeat_note + ' — ' + job.get('message', '')
+        batch_fingerprints.pop(job_id, None)
 
 
 @app.route('/upload', methods=['POST'])
@@ -2702,9 +2724,14 @@ def upload():
     tab = {'thirdparty': 'thirdparty', 'easyship': 'easyship',
            'evri_direct': 'evri_direct'}.get(mode, 'amazon')
 
-    # Skip files already processed on this tab; keep genuinely new ones.
-    fresh_files, dups = check_duplicate_files(pdf_files, tab)
-    dup_summary = build_dup_summary(dups)
+    # Fingerprint the whole upload. Re-uploading the same file(s) is NOT blocked
+    # — labels are always produced — but its pick-list contribution replaces the
+    # previous one (handled in save_pick_list_entries) so totals don't inflate.
+    batch_fp = compute_batch_fingerprint(pdf_files)
+    batch_fingerprints[job_id] = batch_fp
+    repeat_note = None
+    if batch_fingerprint_seen(batch_fp, tab):
+        repeat_note = '♻ Same file run before — totals updated in place, not added'
 
     with jobs_lock:
         jobs[job_id] = {
@@ -2712,19 +2739,6 @@ def upload():
             'message': 'Starting — ' + str(len(pdf_files)) + ' PDF(s) found...',
             'result_path': None, 'results': [], 'batch_id': '', 'download_name': 'merged_labels.pdf'
         }
-        if dup_summary:
-            jobs[job_id]['dup_summary'] = dup_summary
-
-    # Every file was a duplicate — nothing new to do.
-    if not fresh_files:
-        with jobs_lock:
-            jobs[job_id]['status'] = 'done'
-            jobs[job_id]['progress'] = 100
-            jobs[job_id]['message'] = (dup_summary['text'] + ' — nothing new to process'
-                                       if dup_summary else 'Nothing to process')
-            jobs[job_id]['results'] = []
-        return jsonify({'job_id': job_id, 'total': len(pdf_files),
-                        'duplicates': len(dups), 'fresh': 0})
 
     if mode == 'thirdparty':
         target = process_thirdparty
@@ -2735,11 +2749,10 @@ def upload():
     else:
         target = run_job
     t = threading.Thread(target=run_with_dedup,
-                         args=(target, job_id, fresh_files, tmpdir, tab, dup_summary))
+                         args=(target, job_id, pdf_files, tmpdir, repeat_note))
     t.daemon = True
     t.start()
-    return jsonify({'job_id': job_id, 'total': len(pdf_files),
-                    'duplicates': len(dups), 'fresh': len(fresh_files)})
+    return jsonify({'job_id': job_id, 'total': len(pdf_files)})
 
 @app.route('/status/<job_id>')
 def status(job_id):
