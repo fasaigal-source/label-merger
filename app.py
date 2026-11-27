@@ -820,19 +820,27 @@ def extract_items_from_pdf(pdf_path):
 
 # ── OVERLAY FUNCTIONS ─────────────────────────────────────────────────────────
 
-def draw_label_batch_stamp(c, page_num, total_pages, batch_id, x=8, y=8):
+def draw_label_batch_stamp(c, page_num, total_pages, batch_id, page_h=None):
     """Stamp the label's page number within the batch and the batch id onto
     the bottom-left corner. Printed on every label across all tabs so each one
-    can be traced back to its batch and position. No-op when no batch id."""
+    can be traced back to its batch and position. No-op when no batch id.
+
+    Inset matters: full-size (A4) pages go through desktop printers with a
+    5-6mm unprintable margin. Text closer to the edge than that is clipped,
+    and worse, a "fit to printable area" driver shrinks the WHOLE page to pull
+    that corner ink into range — which makes the label itself print smaller.
+    So keep well inside on A4. Thermal 4x6 label printers print much closer to
+    the edge, so the tighter inset is kept there."""
     if not batch_id:
         return
     if page_num and total_pages:
         text = 'p' + str(page_num) + '/' + str(total_pages) + '  B:' + str(batch_id)
     else:
         text = 'B:' + str(batch_id)
-    c.setFont('Helvetica-Bold', 7)
+    inset = 30.0 if (page_h or 0) > 600 else 10.0
+    c.setFont('Helvetica-Bold', 8)
     c.setFillColorRGB(0, 0, 0)
-    c.drawString(x, y, text)
+    c.drawString(inset, inset, text)
 
 
 def create_evri_overlay(items, order_id, page_num, total_pages, batch_id, page_w, page_h, warn=False):
@@ -1259,7 +1267,7 @@ def create_thirdparty_overlay(items, page_w, page_h, page_num=None, total_pages=
     No header; one row per SKU; grows downward and auto-shrinks to fit the band."""
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
-    draw_label_batch_stamp(c, page_num, total_pages, batch_id)
+    draw_label_batch_stamp(c, page_num, total_pages, batch_id, page_h)
     if not items:
         c.save(); packet.seek(0); return packet
 
@@ -1440,7 +1448,7 @@ def create_easyship_overlay(items, page_w, page_h, page_num=None, total_pages=No
     Auto-shrinks only as far as needed for a long SKU or several items."""
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
-    draw_label_batch_stamp(c, page_num, total_pages, batch_id)
+    draw_label_batch_stamp(c, page_num, total_pages, batch_id, page_h)
     if not items:
         c.save(); packet.seek(0); return packet
 
@@ -1454,7 +1462,9 @@ def create_easyship_overlay(items, page_w, page_h, page_num=None, total_pages=No
 
     lines = [f'{s} \u00d7 {q}' for s, q in items]
 
-    row_fs = 20.0
+    # Starting (largest) size for the SKU/Qty text \u2014 one step down from the
+    # original 20pt, as asked, so the stamp sits lighter on the label.
+    row_fs = 18.0
     while row_fs > 8.0:
         lh = row_fs + 5
         total_h = len(lines) * lh
@@ -2288,7 +2298,7 @@ def create_evri_direct_overlay(items, page_w, page_h, page_num=None, total_pages
     label (the sender/logo region) instead of mid-label."""
     packet = io.BytesIO()
     c = canvas.Canvas(packet, pagesize=(page_w, page_h))
-    draw_label_batch_stamp(c, page_num, total_pages, batch_id)
+    draw_label_batch_stamp(c, page_num, total_pages, batch_id, page_h)
     if not items:
         c.save(); packet.seek(0); return packet
 
